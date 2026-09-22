@@ -2,42 +2,451 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <title>Blaze — File Organizer</title>
+    <meta name="description" content="High-performance desktop file organization utility with fast buffered transfers, customizable rules, and preview verification." />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/src/styles.css" />
     <script type="module" src="/src/main.ts" defer></script>
   </head>
-
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+    <div id="app" class="app-root">
+      <!-- Clean Top Bar -->
+      <header id="top-header" class="top-header">
+        <div class="header-left">
+          <div class="brand-group">
+            <div class="brand-icon">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+              </svg>
+            </div>
+            <div class="brand-text">
+              <span class="brand-title">BLAZE</span>
+              <span class="brand-subtitle">File Organizer</span>
+            </div>
+          </div>
+        </div>
 
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
+        <div class="header-right">
+          <div id="status-pill" class="status-indicator-pill">
+            <span class="status-dot"></span>
+            <span id="status-text">Ready</span>
+          </div>
+
+          <button id="settings-btn" class="header-icon-btn" title="Settings" aria-label="Settings">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Main Dual-Panel Workspace with Draggable Divider -->
+      <main id="main-workspace" class="main-workspace">
+        <!-- LEFT PANEL: Controls & Organization Rules -->
+        <aside id="control-panel" class="panel-left">
+          <div class="panel-scroll-content">
+            <!-- Source Folder Section -->
+            <section class="config-section">
+              <div class="section-heading-row">
+                <h2 class="section-title">Source Folder</h2>
+              </div>
+              <div class="field-card">
+                <div class="path-input-group">
+                  <input 
+                    type="text" 
+                    id="source-path-input" 
+                    class="path-input" 
+                    value="C:\Users\Downloads" 
+                    placeholder="Enter or select folder path..."
+                    spellcheck="false"
+                  />
+                  <button id="browse-dir-btn" class="btn btn-secondary" title="Choose folder from dialog">
+                    <span>Browse</span>
+                  </button>
+                </div>
+
+                <div class="field-options-row">
+                  <label class="toggle-option">
+                    <input type="checkbox" id="subfolder-checkbox" />
+                    <span class="toggle-box"></span>
+                    <span class="toggle-label-text">Include subfolders</span>
+                  </label>
+                  <button id="load-sample-btn" class="text-link-btn" title="Load sample dataset to preview sorting">
+                    Load test files
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <!-- Organize By Type (Categories) Section -->
+            <section class="config-section">
+              <div class="section-heading-row">
+                <div class="heading-with-badge">
+                  <h2 class="section-title">Organize by Type</h2>
+                  <span id="categories-summary-badge" class="count-badge">6 active</span>
+                </div>
+                <div class="heading-actions">
+                  <button id="add-category-btn" class="btn btn-sm btn-ghost" title="Create a new sorting category">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                      <line x1="12" y1="5" x2="12" y2="19"></line>
+                      <line x1="5" y1="12" x2="19" y2="12"></line>
+                    </svg>
+                    <span>New Category</span>
+                  </button>
+                  <button id="select-all-rules-btn" class="text-link-btn">All</button>
+                  <span class="sep-dot">·</span>
+                  <button id="clear-all-rules-btn" class="text-link-btn">None</button>
+                </div>
+              </div>
+
+              <!-- Interactive Category Rule Cards -->
+              <div id="category-cards-container" class="category-cards-list">
+                <!-- Dynamically rendered by main.ts -->
+              </div>
+            </section>
+
+            <!-- Custom Extensions Section -->
+            <section class="config-section">
+              <div class="section-heading-row">
+                <h2 class="section-title">Custom Extensions</h2>
+                <span class="field-subtext">Sent to Custom/ folder</span>
+              </div>
+              <div class="field-card">
+                <div class="custom-input-row">
+                  <input 
+                    type="text" 
+                    id="custom-ext-input" 
+                    class="custom-ext-input" 
+                    placeholder="Add extension (e.g. blend, iso, psd)..."
+                  />
+                  <button id="add-ext-btn" class="btn btn-secondary btn-sm">Add</button>
+                </div>
+                <div id="custom-tags-container" class="custom-tags-list"></div>
+              </div>
+            </section>
+
+            <!-- Operation Section -->
+            <section class="config-section">
+              <div class="section-heading-row">
+                <h2 class="section-title">Operation</h2>
+              </div>
+              <div class="field-card">
+                <div class="mode-toggle-group">
+                  <label class="mode-pill-option active">
+                    <input type="radio" name="operation-mode" value="MOVE" checked />
+                    <span class="mode-pill-label">Move files</span>
+                  </label>
+                  <label class="mode-pill-option">
+                    <input type="radio" name="operation-mode" value="COPY" />
+                    <span class="mode-pill-label">Copy files</span>
+                  </label>
+                </div>
+
+                <div class="safeguard-toggles">
+                  <label class="toggle-option">
+                    <input type="checkbox" id="ignore-hidden-checkbox" checked />
+                    <span class="toggle-box"></span>
+                    <span class="toggle-label-text">Skip hidden files (.git, .DS_Store)</span>
+                  </label>
+                  <div class="safeguard-notice">
+                    <span class="notice-bullet">ℹ</span>
+                    <span>Files with identical names at destination are automatically renamed with numbers (e.g. <code>photo (1).jpg</code>) so nothing is overwritten.</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </aside>
+
+        <!-- DRAGGABLE SPLITTER RESIZER -->
+        <div id="panel-resizer" class="panel-resizer" title="Drag to resize panels" role="separator" aria-orientation="vertical">
+          <div class="resizer-handle"></div>
+        </div>
+
+        <!-- RIGHT PANEL: Review & Apply Table -->
+        <section id="review-panel" class="panel-right">
+          <!-- Stage Header -->
+          <div class="stage-header">
+            <div class="stage-header-title">
+              <h1 class="stage-title">Review Changes</h1>
+              <p id="stage-summary-text" class="stage-subtitle">Scan completed · 20 files found (1.9 GB)</p>
+            </div>
+
+            <div class="stage-toolbar">
+              <div class="search-input-wrap">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="11" cy="11" r="8"/>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                <input 
+                  type="text" 
+                  id="table-search-input" 
+                  class="search-input" 
+                  placeholder="Filter files by name or type..." 
+                />
+              </div>
+
+              <!-- Refined Understated Category Tabs -->
+              <div id="category-filter-chips" class="filter-chip-group">
+                <button class="filter-chip active" data-filter="all">All</button>
+                <!-- Rendered dynamically -->
+              </div>
+            </div>
+          </div>
+
+          <!-- Table Container -->
+          <div class="table-container">
+            <table id="review-table" class="clean-table">
+              <thead>
+                <tr>
+                  <th class="col-checkbox">
+                    <input type="checkbox" id="select-all-rows-checkbox" checked title="Select / deselect all" />
+                  </th>
+                  <th class="col-name sortable" data-sort="name">
+                    <span>File</span>
+                    <span class="sort-icon">↕</span>
+                  </th>
+                  <th class="col-type">Type</th>
+                  <th class="col-category sortable" data-sort="category">
+                    <span>Category</span>
+                    <span class="sort-icon">↕</span>
+                  </th>
+                  <th class="col-size sortable" data-sort="size">
+                    <span>Size</span>
+                    <span class="sort-icon">↕</span>
+                  </th>
+                  <th class="col-source">Source</th>
+                  <th class="col-destination">Destination</th>
+                  <th class="col-action">Action</th>
+                </tr>
+              </thead>
+              <tbody id="preview-body">
+                <!-- Rows injected dynamically with soft badges and compact paths -->
+              </tbody>
+            </table>
+
+            <!-- Empty State -->
+            <div id="table-empty-state" class="empty-state-view">
+              <p class="empty-state-title">No files matching active rules</p>
+              <p class="empty-state-subtitle">Select another folder or adjust your categories on the left.</p>
+              <button id="empty-load-sample-btn" class="btn btn-secondary">
+                Load Test Files
+              </button>
+            </div>
+          </div>
+
+          <!-- Bottom Action Dock -->
+          <div class="action-footer-dock">
+            <div class="dock-summary">
+              <span id="dock-status-message">20 files ready to organize. Existing files will not be overwritten.</span>
+            </div>
+
+            <div class="dock-actions">
+              <button id="rescan-btn" class="btn btn-secondary" title="Re-scan source folder">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="23 4 23 10 17 10"/>
+                  <polyline points="1 20 1 14 7 14"/>
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                </svg>
+                <span>Re-scan</span>
+              </button>
+
+              <button id="execute-btn" class="btn btn-primary btn-execute" title="Organize selected files">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                  <polygon points="5 3 19 12 5 21 5 3"/>
+                </svg>
+                <span id="execute-btn-text">Organize 20 files</span>
+              </button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- CATEGORY EDIT / CREATE MODAL -->
+      <div id="category-modal" class="modal-backdrop hidden">
+        <div class="modal-card">
+          <div class="modal-head">
+            <h3 id="cat-modal-title" class="modal-head-title">Edit Category</h3>
+            <button id="cat-modal-close" class="modal-close-btn" aria-label="Close dialog">×</button>
+          </div>
+          <div class="modal-body">
+            <div class="form-row-duo">
+              <div class="form-group flex-1">
+                <label class="form-label" for="cat-name-input">Category Name</label>
+                <input type="text" id="cat-name-input" class="form-input" placeholder="e.g. Images, Financials, 3D Assets" />
+              </div>
+              <div class="form-group icon-field-group">
+                <label class="form-label" for="cat-icon-input">Icon</label>
+                <input type="text" id="cat-icon-input" class="form-input form-input-icon text-center" value="📁" maxlength="2" />
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Quick Icon Presets</label>
+              <div id="icon-preset-list" class="icon-presets-row">
+                <button type="button" class="icon-chip-btn" data-icon="📁">📁</button>
+                <button type="button" class="icon-chip-btn" data-icon="🖼">🖼</button>
+                <button type="button" class="icon-chip-btn" data-icon="📄">📄</button>
+                <button type="button" class="icon-chip-btn" data-icon="🎬">🎬</button>
+                <button type="button" class="icon-chip-btn" data-icon="🎵">🎵</button>
+                <button type="button" class="icon-chip-btn" data-icon="📦">📦</button>
+                <button type="button" class="icon-chip-btn" data-icon="💻">💻</button>
+                <button type="button" class="icon-chip-btn" data-icon="📊">📊</button>
+                <button type="button" class="icon-chip-btn" data-icon="🎨">🎨</button>
+                <button type="button" class="icon-chip-btn" data-icon="⚙">⚙</button>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="cat-folder-input">Destination Folder</label>
+              <input type="text" id="cat-folder-input" class="form-input" placeholder="e.g. Images or Invoices/2026" />
+              <span class="form-help">Created inside your source folder or custom target folder.</span>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="cat-exts-input">Extensions</label>
+              <input type="text" id="cat-exts-input" class="form-input" placeholder="jpg, png, webp, svg..." />
+              <span class="form-help">Separate extensions with commas or spaces.</span>
+            </div>
+
+            <div class="form-group">
+              <label class="toggle-option">
+                <input type="checkbox" id="cat-enabled-input" checked />
+                <span class="toggle-box"></span>
+                <span class="toggle-label-text">Include in sorting scan</span>
+              </label>
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button id="cat-delete-btn" class="btn btn-danger btn-sm" style="margin-right: auto; display: none;">Delete Category</button>
+            <button id="cat-cancel-btn" class="btn btn-secondary">Cancel</button>
+            <button id="cat-save-btn" class="btn btn-primary">Save Changes</button>
+          </div>
+        </div>
       </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-    </main>
+      <!-- SETTINGS MODAL -->
+      <div id="settings-modal" class="modal-backdrop hidden">
+        <div class="modal-card">
+          <div class="modal-head">
+            <h3 class="modal-head-title">Settings</h3>
+            <button id="settings-modal-close" class="modal-close-btn" aria-label="Close settings">×</button>
+          </div>
+          <div class="modal-body settings-body">
+            <div class="settings-section">
+              <h4 class="settings-subtitle">Engine & Performance</h4>
+              <div class="settings-row">
+                <div class="settings-desc">
+                  <strong>High-Speed Buffered Transfer</strong>
+                  <span>Uses Custom High-Speed memory-aligned stream buffers for maximum write throughput across drives.</span>
+                </div>
+                <span class="tag-active">Active</span>
+              </div>
+              <div class="settings-row">
+                <div class="settings-desc">
+                  <strong>Concurrent Worker Threads</strong>
+                  <span>Offloads disk I/O to background system worker threads to prevent interface stutter.</span>
+                </div>
+                <span class="tag-active">Active</span>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <h4 class="settings-subtitle">Conflict Handling</h4>
+              <div class="settings-row">
+                <div class="settings-desc">
+                  <strong>When a file already exists at destination</strong>
+                  <span>Automatically adds a numeric suffix (e.g. <code>file (1).ext</code>) to guarantee zero files are overwritten.</span>
+                </div>
+                <span class="tag-active">Rename on conflict</span>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <h4 class="settings-subtitle">About</h4>
+              <div class="settings-info-box">
+                <div class="info-row">
+                  <span>Version</span>
+                  <span>1.0.0</span>
+                </div>
+                <div class="info-row">
+                  <span>Platform</span>
+                  <span id="settings-platform-val">Desktop</span>
+                </div>
+                <div class="info-row">
+                  <span>Transfer Engine</span>
+                  <span>High Speed Buffered I/O (8 MB)</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button id="settings-done-btn" class="btn btn-primary">Done</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- EXECUTION PROGRESS MODAL -->
+      <div id="execution-modal" class="modal-backdrop hidden">
+        <div class="modal-card">
+          <div class="modal-head">
+            <div class="modal-title-group">
+              <h3 id="exec-modal-title" class="modal-head-title">Organizing Files</h3>
+              <p id="exec-modal-subtitle" class="modal-head-subtitle">Processing files with high-speed buffered transfer...</p>
+            </div>
+            <button id="exec-modal-close" class="modal-close-btn" aria-label="Close modal">×</button>
+          </div>
+
+          <div class="modal-body">
+            <!-- Progress Bar -->
+            <div class="progress-wrap">
+              <div class="progress-info-row">
+                <span id="exec-percentage" class="progress-pct">0%</span>
+                <span id="exec-ratio" class="progress-cnt">0 / 0</span>
+              </div>
+              <div class="progress-bar-bg">
+                <div id="exec-bar-fill" class="progress-bar-fill" style="width: 0%"></div>
+              </div>
+            </div>
+
+            <!-- Factual Results -->
+            <div class="summary-stat-row">
+              <div class="stat-cell">
+                <span class="stat-cell-title">Time</span>
+                <span id="exec-time-val" class="stat-cell-val">--</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-cell-title">Speed</span>
+                <span id="exec-speed-val" class="stat-cell-val">--</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-cell-title">Successful</span>
+                <span id="exec-success-val" class="stat-cell-val">--</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-cell-title">Errors</span>
+                <span id="exec-failed-val" class="stat-cell-val">0</span>
+              </div>
+            </div>
+
+            <!-- Log Console -->
+            <div id="exec-log-console" class="log-console">
+              <!-- Logs appended here -->
+            </div>
+          </div>
+
+          <div class="modal-actions">
+            <button id="exec-done-btn" class="btn btn-primary" style="display: none;">Done</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toast Notifications -->
+      <div id="toast-container" class="toast-container"></div>
+    </div>
   </body>
 </html>

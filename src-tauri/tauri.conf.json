@@ -5,7 +5,7 @@
   "identifier": "com.avanindraa.blaze-file-organizer",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:3000",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
@@ -13,9 +13,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "blaze-file-organizer",
-        "width": 800,
-        "height": 600
+        "title": "Blaze — Ultra-Fast File Organizer",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 960,
+        "minHeight": 640
       }
     ],
     "security": {
