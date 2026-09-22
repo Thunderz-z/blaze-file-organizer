@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +14,6 @@ pub struct CategoryRule {
     pub target_folder: String,
     pub extensions: Vec<String>,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanRules {
     pub categories: Vec<CategoryRule>,
@@ -24,7 +22,6 @@ pub struct ScanRules {
     pub include_hidden: bool,
     pub custom_target_dir: Option<String>,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePreview {
     pub id: String,
@@ -37,7 +34,11 @@ pub struct FilePreview {
     pub conflict_detected: bool,
     pub relative_path: Option<String>,
 }
-
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanResult {
+    pub previews: Vec<FilePreview>,
+    pub skipped_paths: Vec<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileAction {
     pub id: String,
@@ -46,7 +47,11 @@ pub struct FileAction {
     pub category: String,
     pub file_name: String,
 }
-
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletedFile {
+    pub id: String,
+    pub destination_path: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSummary {
     pub total_processed: usize,
@@ -55,8 +60,8 @@ pub struct ExecutionSummary {
     pub time_taken_ms: u64,
     pub mode: String,
     pub errors: Vec<String>,
+    pub completed: Vec<CompletedFile>,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryStats {
     pub path: String,
@@ -64,320 +69,448 @@ pub struct DirectoryStats {
     pub total_size_bytes: u64,
 }
 
-// FastCopy-style 8MB buffer for maximum I/O throughput across partitions
 const FAST_COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const MAX_DESTINATION_ATTEMPTS: u32 = 10_000;
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn resolve_unique_path(target_path: &Path) -> PathBuf {
-    if !target_path.exists() {
-        return target_path.to_path_buf();
+struct CopyOutcome {
+    expected_size: u64,
+    copied_bytes: u64,
+}
+
+fn destination_candidate(target: &Path, counter: u32) -> PathBuf {
+    if counter == 0 {
+        return target.to_path_buf();
     }
-
-    let parent = target_path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = target_path
+    let parent = target.parent().unwrap_or_else(|| Path::new(""));
+    let stem = target
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("file");
-    let ext = target_path
+    let ext = target
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| format!(".{}", e))
+        .map(|e| format!(".{e}"))
         .unwrap_or_default();
-
-    let mut counter = 1;
-    loop {
-        let new_file_name = format!("{}_{}{}", stem, counter, ext);
-        let candidate = parent.join(new_file_name);
-        if !candidate.exists() {
-            return candidate;
-        }
-        counter += 1;
-        if counter > 10000 {
-            // Circuit breaker
-            return parent.join(format!("{}_{}_{}", stem, counter, ext));
-        }
-    }
+    parent.join(format!("{stem}_{counter}{ext}"))
 }
 
-// FastCopy-inspired high throughput buffered copy with size & verification
-fn fast_buffered_copy(src: &Path, dest: &Path) -> io::Result<u64> {
-    let mut reader = File::open(src)?;
-    let mut writer = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(dest)?;
+// Preview paths are advisory only. Execution uses atomic creation/link operations instead.
+fn resolve_preview_destination(target: &Path, reserved: &HashSet<PathBuf>) -> PathBuf {
+    for counter in 0..=MAX_DESTINATION_ATTEMPTS {
+        let candidate = destination_candidate(target, counter);
+        if !candidate.exists() && !reserved.contains(&candidate) {
+            return candidate;
+        }
+    }
+    destination_candidate(target, MAX_DESTINATION_ATTEMPTS + 1)
+}
 
+fn create_temporary_file(parent: &Path, destination: &Path) -> io::Result<(PathBuf, File)> {
+    let name = destination
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("transfer");
+    for _ in 0..MAX_DESTINATION_ATTEMPTS {
+        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{name}.blaze-part-{}-{sequence}",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve a temporary transfer file",
+    ))
+}
+
+// This verifies transfer completeness (byte count and resulting size), not file content.
+// A stronger optional verifier can be added here later without hashing every file by default.
+fn verify_copy_completeness(destination: &Path, outcome: &CopyOutcome) -> io::Result<()> {
+    let destination_size = fs::metadata(destination)?.len();
+    if outcome.copied_bytes != outcome.expected_size || destination_size != outcome.expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "copy size mismatch: expected {} bytes, copied {} bytes, destination has {} bytes",
+                outcome.expected_size, outcome.copied_bytes, destination_size
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn copy_source_to_file(source: &Path, writer: &mut File) -> io::Result<CopyOutcome> {
+    let mut reader = File::open(source)?;
+    let expected_size = reader.metadata()?.len();
     let mut buffer = vec![0u8; FAST_COPY_BUFFER_SIZE];
-    let mut total_copied = 0u64;
-
+    let mut copied_bytes = 0u64;
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
         writer.write_all(&buffer[..bytes_read])?;
-        total_copied += bytes_read as u64;
+        copied_bytes += bytes_read as u64;
     }
-
     writer.flush()?;
-    Ok(total_copied)
+    writer.sync_all()?;
+    Ok(CopyOutcome {
+        expected_size,
+        copied_bytes,
+    })
+}
+
+fn publish_temporary_file(temp: &Path, planned: &Path) -> io::Result<PathBuf> {
+    // hard_link atomically creates the final name and never replaces an existing file. The
+    // temporary file is in the target directory, supporting common Windows/Linux/macOS filesystems.
+    for counter in 0..=MAX_DESTINATION_ATTEMPTS {
+        let candidate = destination_candidate(planned, counter);
+        match fs::hard_link(temp, &candidate) {
+            Ok(()) => {
+                let _ = fs::remove_file(temp);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve a unique destination name",
+    ))
+}
+
+fn copy_to_unique_destination(source: &Path, planned: &Path) -> io::Result<(PathBuf, u64)> {
+    let parent = planned.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination path does not have a parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let (temporary_path, mut temporary_file) = create_temporary_file(parent, planned)?;
+    let outcome = match copy_source_to_file(source, &mut temporary_file) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            drop(temporary_file);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+    };
+    drop(temporary_file);
+    if let Err(error) = verify_copy_completeness(&temporary_path, &outcome) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    match publish_temporary_file(&temporary_path, planned) {
+        Ok(destination) => Ok((destination, outcome.expected_size)),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_path);
+            Err(error)
+        }
+    }
+}
+
+fn try_same_filesystem_move(source: &Path, planned: &Path) -> io::Result<Option<PathBuf>> {
+    let expected_size = fs::metadata(source)?.len();
+    let parent = planned.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination path does not have a parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    // Link+unlink is an atomic no-overwrite same-filesystem move. Unlike rename, it cannot replace a destination.
+    for counter in 0..=MAX_DESTINATION_ATTEMPTS {
+        let candidate = destination_candidate(planned, counter);
+        match fs::hard_link(source, &candidate) {
+            Ok(()) => {
+                verify_copy_completeness(
+                    &candidate,
+                    &CopyOutcome {
+                        expected_size,
+                        copied_bytes: expected_size,
+                    },
+                )?;
+                if fs::metadata(source)?.len() != expected_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "source changed during move; source was preserved",
+                    ));
+                }
+                fs::remove_file(source)?;
+                return Ok(Some(candidate));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            // Cross-volume and hard-link-unsupported filesystems use the guarded copy fallback.
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+fn copy_then_remove_source(source: &Path, planned: &Path) -> io::Result<PathBuf> {
+    let (destination, expected_size) = copy_to_unique_destination(source, planned)?;
+    // Only remove the source after the published destination exists with the expected size.
+    if fs::metadata(&destination)?.len() != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "destination changed before source removal; source was preserved",
+        ));
+    }
+    if fs::metadata(source)?.len() != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "source changed during copy; source was preserved",
+        ));
+    }
+    fs::remove_file(source)?;
+    Ok(destination)
+}
+
+fn transfer_item(source: &Path, planned: &Path, is_move: bool) -> io::Result<PathBuf> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source is not a regular file",
+        ));
+    }
+    if !is_move {
+        return copy_to_unique_destination(source, planned).map(|(destination, _)| destination);
+    }
+    if let Some(destination) = try_same_filesystem_move(source, planned)? {
+        return Ok(destination);
+    }
+    copy_then_remove_source(source, planned)
 }
 
 #[tauri::command]
-pub async fn scan_directory(
-    source_dir: String,
-    rules: ScanRules,
-) -> Result<Vec<FilePreview>, String> {
+async fn scan_directory(source_dir: String, rules: ScanRules) -> Result<ScanResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = Path::new(&source_dir);
         if !root.exists() || !root.is_dir() {
-            return Err(format!("Directory does not exist or is not a folder: {}", source_dir));
+            return Err(format!(
+                "Directory does not exist or is not a folder: {source_dir}"
+            ));
         }
-
-        // Map extension -> (Category Name, Target Folder)
-        let mut ext_map: HashMap<String, (String, String)> = HashMap::new();
-        let mut organizer_folder_names: Vec<String> = Vec::new();
-
-        for cat in &rules.categories {
-            if cat.enabled {
-                organizer_folder_names.push(cat.target_folder.clone());
-                organizer_folder_names.push(cat.name.clone());
-                for ext in &cat.extensions {
-                    let clean = ext.trim().trim_start_matches('.').to_lowercase();
+        let mut ext_map = HashMap::new();
+        let mut organizer_folder_names = Vec::new();
+        for category in &rules.categories {
+            if category.enabled {
+                organizer_folder_names.push(category.target_folder.clone());
+                organizer_folder_names.push(category.name.clone());
+                for extension in &category.extensions {
+                    let clean = extension.trim().trim_start_matches('.').to_lowercase();
                     if !clean.is_empty() {
-                        ext_map.insert(clean, (cat.name.clone(), cat.target_folder.clone()));
+                        ext_map.insert(
+                            clean,
+                            (category.name.clone(), category.target_folder.clone()),
+                        );
                     }
                 }
             }
         }
-
-        // Custom extensions map to "Custom" category
         organizer_folder_names.push("Custom".to_string());
-        for ext in &rules.custom_extensions {
-            let clean = ext.trim().trim_start_matches('.').to_lowercase();
+        for extension in &rules.custom_extensions {
+            let clean = extension.trim().trim_start_matches('.').to_lowercase();
             if !clean.is_empty() {
                 ext_map.insert(clean, ("Custom".to_string(), "Custom".to_string()));
             }
         }
-
         let target_root = match &rules.custom_target_dir {
-            Some(t) if !t.trim().is_empty() => PathBuf::from(t),
+            Some(target) if !target.trim().is_empty() => PathBuf::from(target),
             _ => root.to_path_buf(),
         };
-
         let mut previews = Vec::new();
-        let mut dir_stack: Vec<PathBuf> = vec![root.to_path_buf()];
-
+        let mut skipped_paths = Vec::new();
+        let mut preview_destinations = HashSet::new();
+        let mut dir_stack = vec![root.to_path_buf()];
         while let Some(current_dir) = dir_stack.pop() {
             let entries = match fs::read_dir(&current_dir) {
-                Ok(e) => e,
-                Err(_) => continue, // Gracefully skip unreadable folders
+                Ok(entries) => entries,
+                Err(error) => {
+                    skipped_paths.push(format!("{}: {error}", current_dir.display()));
+                    continue;
+                }
             };
-
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
+            for entry_result in entries {
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        skipped_paths.push(format!("{}: {error}", current_dir.display()));
+                        continue;
+                    }
                 };
-
-                // Skip hidden files unless explicitly requested
+                let path = entry.path();
+                let file_name = match path.file_name().and_then(|name| name.to_str()) {
+                    Some(name) => name.to_string(),
+                    None => {
+                        skipped_paths.push(format!("{}: non-Unicode file name", path.display()));
+                        continue;
+                    }
+                };
                 if !rules.include_hidden && file_name.starts_with('.') {
                     continue;
                 }
-
                 let file_type = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        skipped_paths.push(format!("{}: {error}", path.display()));
+                        continue;
+                    }
                 };
-
-                // Safety: never follow directory symlinks to prevent infinite loops on Linux/macOS
+                // Never follow symlinks: directory links cannot create recursive traversal loops.
+                if file_type.is_symlink() {
+                    continue;
+                }
                 if file_type.is_dir() {
-                    if rules.include_subfolders && !file_type.is_symlink() {
-                        // Skip system and recursive target folders to avoid loop
-                        let is_organizer_folder = organizer_folder_names.iter().any(|target| target == &file_name);
-                        if !is_organizer_folder {
-                            dir_stack.push(path);
-                        }
+                    if rules.include_subfolders
+                        && !organizer_folder_names
+                            .iter()
+                            .any(|target| target == &file_name)
+                    {
+                        dir_stack.push(path);
                     }
                     continue;
                 }
-
                 if !file_type.is_file() {
                     continue;
                 }
-
-                let ext = path
+                let extension = path
                     .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_lowercase())
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| extension.to_lowercase())
                     .unwrap_or_default();
-
-                if let Some((cat_name, target_folder)) = ext_map.get(&ext) {
-                    let dest_folder = target_root.join(target_folder);
-                    let nominal_dest = dest_folder.join(&file_name);
-                    let conflict = nominal_dest.exists();
-                    let final_dest = resolve_unique_path(&nominal_dest);
-
-                    let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    let relative_path = path.strip_prefix(root).ok().map(|p| p.to_string_lossy().to_string());
-
+                if let Some((category_name, target_folder)) = ext_map.get(&extension) {
+                    let nominal = target_root.join(target_folder).join(&file_name);
+                    let conflict_detected =
+                        nominal.exists() || preview_destinations.contains(&nominal);
+                    let destination = resolve_preview_destination(&nominal, &preview_destinations);
+                    let size_bytes = match entry.metadata() {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) => {
+                            skipped_paths.push(format!("{}: {error}", path.display()));
+                            continue;
+                        }
+                    };
+                    preview_destinations.insert(destination.clone());
                     previews.push(FilePreview {
                         id: format!("{}:{}", previews.len(), path.display()),
                         file_name,
-                        extension: ext,
-                        category: cat_name.clone(),
+                        extension,
+                        category: category_name.clone(),
                         source_path: path.to_string_lossy().to_string(),
-                        destination_path: final_dest.to_string_lossy().to_string(),
+                        destination_path: destination.to_string_lossy().to_string(),
                         size_bytes,
-                        conflict_detected: conflict,
-                        relative_path,
+                        conflict_detected,
+                        relative_path: path
+                            .strip_prefix(root)
+                            .ok()
+                            .map(|relative| relative.to_string_lossy().to_string()),
                     });
                 }
             }
         }
-
-        Ok(previews)
+        Ok(ScanResult {
+            previews,
+            skipped_paths,
+        })
     })
     .await
-    .map_err(|e| format!("Task execution failed: {}", e))?
+    .map_err(|error| format!("Scan task failed: {error}"))?
+}
+
+fn execute_organization_blocking(items: &[FileAction], mode: &str) -> ExecutionSummary {
+    let start_time = Instant::now();
+    let is_move = mode.eq_ignore_ascii_case("MOVE");
+    let mut successful = 0;
+    let mut failed = 0;
+    let mut errors = Vec::new();
+    let mut completed = Vec::new();
+    for item in items {
+        match transfer_item(
+            Path::new(&item.source_path),
+            Path::new(&item.destination_path),
+            is_move,
+        ) {
+            Ok(destination) => {
+                successful += 1;
+                completed.push(CompletedFile {
+                    id: item.id.clone(),
+                    destination_path: destination.to_string_lossy().to_string(),
+                });
+            }
+            Err(error) => {
+                failed += 1;
+                errors.push(format!("{}: {error}", item.source_path));
+            }
+        }
+    }
+    ExecutionSummary {
+        total_processed: items.len(),
+        successful,
+        failed,
+        time_taken_ms: start_time.elapsed().as_millis() as u64,
+        mode: mode.to_string(),
+        errors,
+        completed,
+    }
 }
 
 #[tauri::command]
-pub async fn execute_organization(
+async fn execute_organization(
     items: Vec<FileAction>,
     mode: String,
 ) -> Result<ExecutionSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let start_time = Instant::now();
-        let is_move = mode.to_uppercase() == "MOVE";
-
-        let successful = Arc::new(AtomicUsize::new(0));
-        let failed = Arc::new(AtomicUsize::new(0));
-        let mut errors = Vec::new();
-
-        // Process sequentially or multi-thread depending on disk strategy
-        for item in &items {
-            let src = Path::new(&item.source_path);
-            let dest = Path::new(&item.destination_path);
-
-            if !src.exists() {
-                failed.fetch_add(1, Ordering::Relaxed);
-                errors.push(format!("Source does not exist: {}", item.source_path));
-                continue;
-            }
-
-            // Ensure destination directory exists
-            if let Some(parent) = dest.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.push(format!("Failed to create folder {}: {}", parent.display(), e));
-                    continue;
-                }
-            }
-
-            if is_move {
-                // Try instant atomic filesystem rename first (same disk volume)
-                match fs::rename(src, dest) {
-                    Ok(_) => {
-                        successful.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(rename_err) => {
-                        // FastCopy-style 8MB buffered copy across physical drive boundaries
-                        match fast_buffered_copy(src, dest) {
-                            Ok(copied_bytes) => {
-                                let src_size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-                                if copied_bytes == src_size {
-                                    if let Err(del_err) = fs::remove_file(src) {
-                                        errors.push(format!(
-                                            "Copied but could not remove source {}: {}",
-                                            item.source_path, del_err
-                                        ));
-                                    }
-                                    successful.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    let _ = fs::remove_file(dest);
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                    errors.push(format!(
-                                        "Integrity check failed for {}: expected {} bytes, copied {}",
-                                        item.source_path, src_size, copied_bytes
-                                    ));
-                                }
-                            }
-                            Err(copy_err) => {
-                                failed.fetch_add(1, Ordering::Relaxed);
-                                errors.push(format!(
-                                    "Move failed for {}: (rename: {}, copy: {})",
-                                    item.source_path, rename_err, copy_err
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else {
-                // High-performance buffered copy
-                match fast_buffered_copy(src, dest) {
-                    Ok(_) => {
-                        successful.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        errors.push(format!("Copy failed for {}: {}", item.source_path, e));
-                    }
-                }
-            }
-        }
-
-        let elapsed = start_time.elapsed().as_millis() as u64;
-
-        Ok(ExecutionSummary {
-            total_processed: items.len(),
-            successful: successful.load(Ordering::Relaxed),
-            failed: failed.load(Ordering::Relaxed),
-            time_taken_ms: elapsed,
-            mode,
-            errors,
-        })
-    })
-    .await
-    .map_err(|e| format!("Organization thread failed: {}", e))?
+    tauri::async_runtime::spawn_blocking(move || Ok(execute_organization_blocking(&items, &mode)))
+        .await
+        .map_err(|error| format!("Organization task failed: {error}"))?
 }
 
 #[tauri::command]
-pub async fn get_folder_stats(path: String) -> Result<DirectoryStats, String> {
+async fn get_folder_stats(path: String) -> Result<DirectoryStats, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let p = Path::new(&path);
-        if !p.is_dir() {
+        let directory = Path::new(&path);
+        if !directory.is_dir() {
             return Err("Path is not a directory".to_string());
         }
-
-        let mut count = 0;
-        let mut total_size = 0;
-
-        if let Ok(entries) = fs::read_dir(p) {
+        let mut total_files = 0;
+        let mut total_size_bytes = 0;
+        if let Ok(entries) = fs::read_dir(directory) {
             for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        count += 1;
-                        total_size += meta.len();
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.is_file() {
+                        total_files += 1;
+                        total_size_bytes += metadata.len();
                     }
                 }
             }
         }
-
         Ok(DirectoryStats {
             path,
-            total_files: count,
-            total_size_bytes: total_size,
+            total_files,
+            total_size_bytes,
         })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 fn greet(name: &str) -> String {
-    format!("Blaze Engine ready. Hello, {}!", name)
+    format!("Blaze Engine ready. Hello, {name}!")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -395,6 +528,138 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    fn test_directory(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "blaze-file-organizer-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+    fn action(id: &str, source: &Path, destination: &Path) -> FileAction {
+        FileAction {
+            id: id.to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            destination_path: destination.to_string_lossy().to_string(),
+            category: "Test".to_string(),
+            file_name: source.file_name().unwrap().to_string_lossy().to_string(),
+        }
+    }
 
-
-
+    #[test]
+    fn advisory_names_avoid_existing_and_reserved_destinations() {
+        let directory = test_directory("advisory-names");
+        let target = directory.join("report.txt");
+        fs::write(&target, "existing").unwrap();
+        let mut reserved = HashSet::new();
+        reserved.insert(directory.join("report_1.txt"));
+        assert_eq!(
+            resolve_preview_destination(&target, &reserved),
+            directory.join("report_2.txt")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn copy_preserves_existing_destination_and_resolves_collision() {
+        let directory = test_directory("copy-collision");
+        let source = directory.join("source.txt");
+        let target = directory.join("target.txt");
+        fs::write(&source, "new").unwrap();
+        fs::write(&target, "existing").unwrap();
+        let (actual, _) = copy_to_unique_destination(&source, &target).unwrap();
+        assert_eq!(actual, directory.join("target_1.txt"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+        assert_eq!(fs::read_to_string(&actual).unwrap(), "new");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn duplicate_batch_destinations_are_uniquely_resolved() {
+        let directory = test_directory("duplicate-batch");
+        let first = directory.join("first/same.txt");
+        let second = directory.join("second/same.txt");
+        let target = directory.join("organized/same.txt");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, "one").unwrap();
+        fs::write(&second, "two").unwrap();
+        let summary = execute_organization_blocking(
+            &[
+                action("first", &first, &target),
+                action("second", &second, &target),
+            ],
+            "COPY",
+        );
+        assert_eq!(summary.successful, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            summary.completed[0].destination_path,
+            target.to_string_lossy()
+        );
+        assert_eq!(
+            Path::new(&summary.completed[1].destination_path),
+            directory.join("organized").join("same_1.txt")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn stale_destination_created_after_preview_is_preserved() {
+        let directory = test_directory("stale-destination");
+        let source = directory.join("source.txt");
+        let target = directory.join("organized/source.txt");
+        fs::write(&source, "source").unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "created after scan").unwrap();
+        let summary = execute_organization_blocking(&[action("source", &source, &target)], "COPY");
+        assert_eq!(summary.successful, 1);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "created after scan");
+        assert_eq!(
+            fs::read_to_string(directory.join("organized/source_1.txt")).unwrap(),
+            "source"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn copy_failure_preserves_source() {
+        let directory = test_directory("copy-failure");
+        let source = directory.join("source.txt");
+        let invalid_parent = directory.join("not-a-directory");
+        fs::write(&source, "keep me").unwrap();
+        fs::write(&invalid_parent, "blocker").unwrap();
+        assert!(copy_to_unique_destination(&source, &invalid_parent.join("target.txt")).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "keep me");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn same_filesystem_move_removes_source_after_safe_publish() {
+        let directory = test_directory("same-volume-move");
+        let source = directory.join("source.txt");
+        let target = directory.join("organized/source.txt");
+        fs::write(&source, "move me").unwrap();
+        let summary = execute_organization_blocking(&[action("source", &source, &target)], "MOVE");
+        assert_eq!(summary.successful, 1);
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "move me");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn copy_fallback_move_removes_source_only_after_verified_copy() {
+        let directory = test_directory("copy-fallback-move");
+        let source = directory.join("source.txt");
+        let target = directory.join("organized/source.txt");
+        fs::write(&source, "fallback payload").unwrap();
+        let actual = copy_then_remove_source(&source, &target).unwrap();
+        assert!(!source.exists());
+        assert_eq!(actual, target);
+        assert_eq!(fs::read_to_string(&actual).unwrap(), "fallback payload");
+        fs::remove_dir_all(directory).unwrap();
+    }
+}

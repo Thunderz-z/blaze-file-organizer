@@ -40,24 +40,24 @@
 
 - `src-tauri/src/lib.rs — scan_directory`: async command which runs blocking filesystem traversal off the async runtime.
 - `src-tauri/src/lib.rs — execute_organization`: sequential move/copy executor returning `ExecutionSummary`.
-- `src-tauri/src/lib.rs — resolve_unique_path`: derives `_N` name for a destination that already exists at scan time.
-- `src-tauri/src/lib.rs — fast_buffered_copy`: 8 MiB buffered truncate-and-write copy primitive.
+- `src-tauri/src/lib.rs — resolve_preview_destination`: derives advisory `_N` preview names only.
+- `src-tauri/src/lib.rs — copy_to_unique_destination` / `transfer_item`: execution-time collision reservation and guarded move/copy engine.
 - `src-tauri/src/lib.rs — run`: registers `greet`, `scan_directory`, `execute_organization`, `get_folder_stats`, dialog, and opener.
 
 ## Frontend ↔ Backend Communication
 
 - `src/main.ts` imports `invoke` from `@tauri-apps/api/core` and dialog `open` from `@tauri-apps/plugin-dialog`.
-- `invoke("scan_directory", { sourceDir, rules })` maps camel-case call arguments to Rust `source_dir` / `ScanRules` and returns `FilePreview[]`.
-- `invoke("execute_organization", { items, mode })` sends selected `FileAction[]` and gets `ExecutionSummary`.
+- `invoke("scan_directory", { sourceDir, rules })` maps camel-case call arguments to Rust `source_dir` / `ScanRules` and returns `ScanResult` (`previews` plus `skipped_paths`).
+- `invoke("execute_organization", { items, mode })` sends selected `FileAction[]` and gets `ExecutionSummary`, including actual destinations in `completed`.
 - Shared serializable DTO contracts live redundantly in `src/main.ts` interfaces and `src-tauri/src/lib.rs` structs; keep field names aligned.
 
 ## File Organization / Transfer Flow
 
 1. `handleBrowseFolder` uses native dialog; `triggerScan` also runs after rule/filter changes.
 2. `scan_directory` builds extension → category/folder map, walks root (optionally subfolders), skips dotfiles unless enabled, and skips organizer folders during recursion.
-3. Matching files become previews with source, intended destination, size, relative path, and initial conflict flag; all are selected by default.
+3. Matching files become previews with source, advisory destination, size, relative path, and initial conflict flag; all are selected by default. Scan continues around unreadable paths and returns warnings.
 4. `handleExecute` converts selected previews to actions and invokes `execute_organization` in `MOVE` or `COPY` mode.
-5. Executor creates parents; move tries rename then copy+delete for cross-volume transfers; copy uses buffered I/O.
+5. Executor atomically claims final names at execution time. Same-volume move uses link+unlink; fallback copy writes a private temp file, validates byte count/size, atomically publishes it, then deletes source only after rechecks.
 
 ## Important Files & Symbols
 
@@ -79,25 +79,24 @@
 
 ## Known Issues / TODOs
 
-- `src/main.ts — handleExecute`: native invocation failure is displayed as all files successful (`finishExecution(total, 0, ...)`), masking data-loss/permission errors.
-- `src-tauri/src/lib.rs — scan_directory` + `execute_organization`: destination names are fixed before execution. Stale previews or same-name files from different subfolders can converge on one destination; `fast_buffered_copy` truncates it. Re-resolve destinations atomically during execution and reject/rename collisions.
-- `src/main.ts — renderCategoryCards`, `renderTable`, `renderCustomTags`: interpolates file names and editable rule values with `innerHTML` without escaping (local DOM injection risk).
-- `src-tauri/tauri.conf.json`: CSP is `null`; define a restrictive CSP before shipping.
-- Scanning silently skips unreadable directories and only recognizes hidden files by a leading dot; report skipped paths and handle platform-specific hidden attributes if needed.
-- No test suite is evident in the indexed source; add unit tests for naming/collision behavior and integration tests for command contracts.
+- Size-only copy checks are completeness checks, not cryptographic content verification; a stronger optional verifier is intentionally deferred.
+- Hard-link publication targets normal NTFS/APFS/ext-family filesystems. Filesystems without hard-link support currently fail safely rather than overwrite a destination.
+- Hidden-file filtering remains dotfile-only; platform-specific Windows hidden attributes are not yet covered.
+- No end-to-end Tauri/UI test suite exists; Rust unit tests cover reservation, collisions, stale state, and guarded move/copy behavior.
 
 ## Architectural Constraints
 
 - Preserve the JSON field contract: frontend uses snake_case payload fields matching Rust serde structs.
 - Keep filesystem work inside `spawn_blocking`; do not block the Tauri async runtime.
 - Do not follow directory symlinks during recursive scans; this avoids loops.
-- Never overwrite destination data: maintain collision protection at execution time, not only preview time.
+- Never overwrite destination data: maintain collision protection at execution time, not only preview time; preview paths are advisory.
 - Release Cargo profile favors size/performance (`lto`, `opt-level=3`, `panic=abort`, strip).
 
 ## Development Guidelines
 
 - Use `npm run dev` for browser UI; use `npm run tauri dev` for the desktop app. `npm run build` runs `tsc && vite build`; `npm run lint` is `tsc --noEmit`; `npm run tauri build` packages the app.
 - Tauri expects Vite port 3000 and `dist` output; retain matching values in `vite.config.ts` and `tauri.conf.json`.
+- CSP permits `ipc:`/`http://ipc.localhost` for Tauri commands, the local HMR WebSocket, asset protocols, and `'unsafe-inline'` styles for existing inline UI style mutations; do not broaden scripts.
 - Keep frontend transport types and Rust serde structs in sync when adding a command or field.
 - Prefer structured DOM APIs or escaping for any filesystem/user-provided string rendered by the UI.
 
