@@ -78,6 +78,43 @@ struct CopyOutcome {
     copied_bytes: u64,
 }
 
+#[cfg(target_os = "windows")]
+fn is_hidden_path(path: &Path, metadata: Option<&fs::Metadata>) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        if file_name.starts_with('.') {
+            return true;
+        }
+    }
+    if let Some(meta) = metadata {
+        return (meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN) != 0;
+    }
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        return (meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN) != 0;
+    }
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_hidden_path(path: &Path, _metadata: Option<&fs::Metadata>) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false)
+}
+
+fn is_same_file(source: &Path, destination: &Path) -> bool {
+    if source == destination {
+        return true;
+    }
+    match (fs::canonicalize(source), fs::canonicalize(destination)) {
+        (Ok(src), Ok(dst)) => src == dst,
+        _ => false,
+    }
+}
+
 fn destination_candidate(target: &Path, counter: u32) -> PathBuf {
     if counter == 0 {
         return target.to_path_buf();
@@ -171,16 +208,78 @@ fn copy_source_to_file(source: &Path, writer: &mut File) -> io::Result<CopyOutco
     })
 }
 
+#[cfg(target_os = "windows")]
+fn rename_no_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide_src: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let wide_dst: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    extern "system" {
+        fn MoveFileExW(src: *const u16, dst: *const u16, flags: u32) -> i32;
+    }
+
+    let success = unsafe { MoveFileExW(wide_src.as_ptr(), wide_dst.as_ptr(), 0) };
+    if success != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn fallback_copy_stream_no_overwrite(temp: &Path, candidate: &Path) -> io::Result<()> {
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(candidate)?;
+    let mut reader = File::open(temp)?;
+    io::copy(&mut reader, &mut writer)?;
+    writer.flush()?;
+    writer.sync_all()?;
+    drop(writer);
+    drop(reader);
+    let _ = fs::remove_file(temp);
+    Ok(())
+}
+
+fn publish_fallback_no_overwrite(temp: &Path, candidate: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        match rename_no_overwrite(temp, candidate) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(err),
+            Err(_) => fallback_copy_stream_no_overwrite(temp, candidate),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        fallback_copy_stream_no_overwrite(temp, candidate)
+    }
+}
+
+fn publish_candidate(temp: &Path, candidate: &Path) -> io::Result<()> {
+    match fs::hard_link(temp, candidate) {
+        Ok(()) => {
+            let _ = fs::remove_file(temp);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => {
+            // Hard links are unavailable or unsupported on this filesystem (e.g. FAT32/exFAT).
+            // Fall back to safe publishing without overwriting.
+            publish_fallback_no_overwrite(temp, candidate)
+        }
+    }
+}
+
 fn publish_temporary_file(temp: &Path, planned: &Path) -> io::Result<PathBuf> {
-    // hard_link atomically creates the final name and never replaces an existing file. The
-    // temporary file is in the target directory, supporting common Windows/Linux/macOS filesystems.
     for counter in 0..=MAX_DESTINATION_ATTEMPTS {
         let candidate = destination_candidate(planned, counter);
-        match fs::hard_link(temp, &candidate) {
-            Ok(()) => {
-                let _ = fs::remove_file(temp);
-                return Ok(candidate);
-            }
+        match publish_candidate(temp, &candidate) {
+            Ok(()) => return Ok(candidate),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -244,8 +343,7 @@ fn try_same_filesystem_move(source: &Path, planned: &Path) -> io::Result<Option<
                     },
                 )?;
                 if fs::metadata(source)?.len() != expected_size {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         "source changed during move; source was preserved",
                     ));
                 }
@@ -270,8 +368,7 @@ fn copy_then_remove_source(source: &Path, planned: &Path) -> io::Result<PathBuf>
         ));
     }
     if fs::metadata(source)?.len() != expected_size {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "source changed during copy; source was preserved",
         ));
     }
@@ -286,6 +383,9 @@ fn transfer_item(source: &Path, planned: &Path, is_move: bool) -> io::Result<Pat
             io::ErrorKind::InvalidInput,
             "source is not a regular file",
         ));
+    }
+    if is_same_file(source, planned) {
+        return Ok(planned.to_path_buf());
     }
     if !is_move {
         return copy_to_unique_destination(source, planned).map(|(destination, _)| destination);
@@ -361,7 +461,8 @@ async fn scan_directory(source_dir: String, rules: ScanRules) -> Result<ScanResu
                         continue;
                     }
                 };
-                if !rules.include_hidden && file_name.starts_with('.') {
+                let metadata = entry.metadata().ok();
+                if !rules.include_hidden && is_hidden_path(&path, metadata.as_ref()) {
                     continue;
                 }
                 let file_type = match entry.file_type() {
@@ -395,15 +496,21 @@ async fn scan_directory(source_dir: String, rules: ScanRules) -> Result<ScanResu
                     .unwrap_or_default();
                 if let Some((category_name, target_folder)) = ext_map.get(&extension) {
                     let nominal = target_root.join(target_folder).join(&file_name);
+                    if is_same_file(&path, &nominal) {
+                        continue;
+                    }
                     let conflict_detected =
                         nominal.exists() || preview_destinations.contains(&nominal);
                     let destination = resolve_preview_destination(&nominal, &preview_destinations);
-                    let size_bytes = match entry.metadata() {
-                        Ok(metadata) => metadata.len(),
-                        Err(error) => {
-                            skipped_paths.push(format!("{}: {error}", path.display()));
-                            continue;
-                        }
+                    let size_bytes = match metadata {
+                        Some(ref m) => m.len(),
+                        None => match entry.metadata() {
+                            Ok(m) => m.len(),
+                            Err(error) => {
+                                skipped_paths.push(format!("{}: {error}", path.display()));
+                                continue;
+                            }
+                        },
                     };
                     preview_destinations.insert(destination.clone());
                     previews.push(FilePreview {
@@ -660,6 +767,77 @@ mod tests {
         assert!(!source.exists());
         assert_eq!(actual, target);
         assert_eq!(fs::read_to_string(&actual).unwrap(), "fallback payload");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn self_collision_preserves_destination_without_suffix() {
+        let directory = test_directory("self-collision");
+        let target = directory.join("organized/source.txt");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "already organized").unwrap();
+        let summary_move =
+            execute_organization_blocking(&[action("self-move", &target, &target)], "MOVE");
+        assert_eq!(summary_move.successful, 1);
+        assert_eq!(
+            summary_move.completed[0].destination_path,
+            target.to_string_lossy()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "already organized");
+        assert!(!directory.join("organized/source_1.txt").exists());
+
+        let summary_copy =
+            execute_organization_blocking(&[action("self-copy", &target, &target)], "COPY");
+        assert_eq!(summary_copy.successful, 1);
+        assert_eq!(
+            summary_copy.completed[0].destination_path,
+            target.to_string_lossy()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "already organized");
+        assert!(!directory.join("organized/source_1.txt").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn destination_publishing_fallback_does_not_overwrite() {
+        let directory = test_directory("publishing-fallback");
+        let temp = directory.join("temp.blaze-part");
+        let target = directory.join("target.txt");
+        fs::write(&temp, "new content").unwrap();
+        fs::write(&target, "original content").unwrap();
+
+        assert!(publish_fallback_no_overwrite(&temp, &target).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original content");
+
+        let available = directory.join("available.txt");
+        assert!(publish_fallback_no_overwrite(&temp, &available).is_ok());
+        assert_eq!(fs::read_to_string(&available).unwrap(), "new content");
+        assert!(!temp.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_hidden_file_detection() {
+        use std::os::windows::ffi::OsStrExt;
+        let directory = test_directory("hidden-files");
+        let normal_file = directory.join("normal.txt");
+        let hidden_file = directory.join("hidden.txt");
+        let dot_file = directory.join(".dotfile.txt");
+        fs::write(&normal_file, "normal").unwrap();
+        fs::write(&hidden_file, "hidden").unwrap();
+        fs::write(&dot_file, "dot").unwrap();
+
+        extern "system" {
+            fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+        }
+        let wide: Vec<u16> = hidden_file
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        unsafe { SetFileAttributesW(wide.as_ptr(), 0x0000_0002) };
+
+        assert!(!is_hidden_path(&normal_file, None));
+        assert!(is_hidden_path(&hidden_file, None));
+        assert!(is_hidden_path(&dot_file, None));
         fs::remove_dir_all(directory).unwrap();
     }
 }

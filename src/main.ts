@@ -485,7 +485,9 @@ function setupEventListeners() {
 
   // Execution Modal Handlers
   execModalClose.addEventListener("click", () => {
+    if (isExecuting) return;
     executionModal.classList.add("hidden");
+    triggerScan();
   });
   execDoneBtn.addEventListener("click", () => {
     executionModal.classList.add("hidden");
