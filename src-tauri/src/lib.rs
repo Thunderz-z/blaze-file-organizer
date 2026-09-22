@@ -186,8 +186,14 @@ pub async fn scan_directory(
                     continue;
                 }
 
-                if path.is_dir() {
-                    if rules.include_subfolders {
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+
+                // Safety: never follow directory symlinks to prevent infinite loops on Linux/macOS
+                if file_type.is_dir() {
+                    if rules.include_subfolders && !file_type.is_symlink() {
                         // Skip system and recursive target folders to avoid loop
                         let is_organizer_folder = organizer_folder_names.iter().any(|target| target == &file_name);
                         if !is_organizer_folder {
@@ -197,7 +203,7 @@ pub async fn scan_directory(
                     continue;
                 }
 
-                if !path.is_file() {
+                if !file_type.is_file() {
                     continue;
                 }
 

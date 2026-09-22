@@ -60,7 +60,7 @@
                     type="text" 
                     id="source-path-input" 
                     class="path-input" 
-                    value="C:\Users\Downloads" 
+                    value="" 
                     placeholder="Enter or select folder path..."
                     spellcheck="false"
                   />
@@ -75,9 +75,6 @@
                     <span class="toggle-box"></span>
                     <span class="toggle-label-text">Include subfolders</span>
                   </label>
-                  <button id="load-sample-btn" class="text-link-btn" title="Load sample dataset to preview sorting">
-                    Load test files
-                  </button>
                 </div>
               </div>
             </section>
@@ -173,7 +170,7 @@
           <div class="stage-header">
             <div class="stage-header-title">
               <h1 class="stage-title">Review Changes</h1>
-              <p id="stage-summary-text" class="stage-subtitle">Scan completed · 20 files found (1.9 GB)</p>
+              <p id="stage-summary-text" class="stage-subtitle">Select a folder to scan</p>
             </div>
 
             <div class="stage-toolbar">
@@ -231,10 +228,13 @@
 
             <!-- Empty State -->
             <div id="table-empty-state" class="empty-state-view">
-              <p class="empty-state-title">No files matching active rules</p>
-              <p class="empty-state-subtitle">Select another folder or adjust your categories on the left.</p>
-              <button id="empty-load-sample-btn" class="btn btn-secondary">
-                Load Test Files
+              <p id="empty-state-title" class="empty-state-title">No folder selected</p>
+              <p id="empty-state-subtitle" class="empty-state-subtitle">Click Browse to choose a folder to organize.</p>
+              <button id="empty-browse-btn" class="btn btn-secondary">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                </svg>
+                <span>Browse Folder</span>
               </button>
             </div>
           </div>
@@ -242,7 +242,7 @@
           <!-- Bottom Action Dock -->
           <div class="action-footer-dock">
             <div class="dock-summary">
-              <span id="dock-status-message">20 files ready to organize. Existing files will not be overwritten.</span>
+              <span id="dock-status-message">No files selected</span>
             </div>
 
             <div class="dock-actions">
@@ -255,11 +255,11 @@
                 <span>Re-scan</span>
               </button>
 
-              <button id="execute-btn" class="btn btn-primary btn-execute" title="Organize selected files">
+              <button id="execute-btn" class="btn btn-primary btn-execute" title="Organize selected files" disabled>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                   <polygon points="5 3 19 12 5 21 5 3"/>
                 </svg>
-                <span id="execute-btn-text">Organize 20 files</span>
+                <span id="execute-btn-text">Organize files</span>
               </button>
             </div>
           </div>

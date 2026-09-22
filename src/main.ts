@@ -102,7 +102,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
 ];
 
 // Global State
-let currentPath = "C:\\Users\\Downloads";
+let currentPath = "";
 let isSubfoldersEnabled = false;
 let ignoreHidden = true;
 let operationMode: "MOVE" | "COPY" = "MOVE";
@@ -122,92 +122,6 @@ let editingCategoryId: string | null = null;
 // Environment check
 function isTauri(): boolean {
   return typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window);
-}
-
-// Generate Realistic Benchmark Dataset
-function generateSampleDataset(baseDir: string, recursive: boolean): FilePreview[] {
-  const baseSamples = [
-    { name: "quarterly_financial_report_2026", ext: "pdf", size: 4194304 },
-    { name: "profile_avatar_highres", ext: "png", size: 1843200 },
-    { name: "nature_wallpaper_4k", ext: "jpg", size: 5242880 },
-    { name: "product_demo_v2_final", ext: "mp4", size: 104857600 },
-    { name: "podcast_interview_ep08", ext: "mp3", size: 31457280 },
-    { name: "system_backup_archive", ext: "zip", size: 268435456 },
-    { name: "blaze_optimizer_core", ext: "rs", size: 28400 },
-    { name: "react_virtual_table", ext: "tsx", size: 14200 },
-    { name: "game_assets_3d_model", ext: "blend", size: 83886080 },
-    { name: "linux_distro_bootable", ext: "iso", size: 1073741824 },
-    { name: "photoshop_ui_mockup", ext: "psd", size: 52428800 },
-    { name: "employee_tax_summary", ext: "xlsx", size: 852000 },
-    { name: "contract_nda_signed", ext: "docx", size: 1204000 },
-    { name: "icon_vector_export", ext: "svg", size: 45000 },
-    { name: "camera_raw_shoot_042", ext: "raw", size: 24500000 },
-    { name: "web_animation_asset", ext: "webp", size: 320000 },
-    { name: "tutorial_screencast_1080p", ext: "mkv", size: 85000000 },
-    { name: "studio_master_track", ext: "wav", size: 68000000 },
-    { name: "docker_image_layers", ext: "tar", size: 180000000 },
-    { name: "database_dump_prod", ext: "sql", size: 14000000 },
-  ];
-
-  const nestedSamples = [
-    { name: "invoice_august_2026", ext: "pdf", size: 210000, sub: "Finance" },
-    { name: "contract_draft_v3", ext: "docx", size: 890000, sub: "Legal" },
-    { name: "raw_footage_b_roll", ext: "mov", size: 340000000, sub: "Projects\\Video" },
-    { name: "server_access_logs", ext: "txt", size: 420000, sub: "ServerLogs" },
-    { name: "ui_component_palette", ext: "svg", size: 120000, sub: "Design" },
-    { name: "archive_source_code", ext: "7z", size: 55000000, sub: "Backup" },
-    { name: "sound_fx_chime", ext: "flac", size: 4500000, sub: "AudioStems" },
-    { name: "package_bundle_dist", ext: "zip", size: 12000000, sub: "Releases" },
-  ];
-
-  const pool = recursive ? [...baseSamples, ...nestedSamples] : baseSamples;
-  const result: FilePreview[] = [];
-
-  // Match items against active categories and custom extensions
-  pool.forEach((item, index) => {
-    let matchedCat: CategoryRule | undefined = categories.find(
-      (c) => c.enabled && c.extensions.some((ext) => ext.toLowerCase() === item.ext.toLowerCase())
-    );
-
-    let catName = "";
-    let targetFolder = "";
-
-    if (matchedCat) {
-      catName = matchedCat.name;
-      targetFolder = matchedCat.target_folder;
-    } else if (customExtensions.includes(item.ext.toLowerCase())) {
-      catName = "Custom";
-      targetFolder = "Custom";
-    } else {
-      // Ignored / unmapped
-      return;
-    }
-
-    const fileNameWithExt = `${item.name}.${item.ext}`;
-    const sub = "sub" in item ? (item as { sub: string }).sub : undefined;
-    const sourceDir = sub ? `${baseDir}\\${sub}` : baseDir;
-    const sourcePath = `${sourceDir}\\${fileNameWithExt}`;
-    
-    // Simulate conflict on every 4th file to demonstrate rename if needed
-    const isConflict = index % 4 === 0;
-    const destPath = isConflict
-      ? `${baseDir}\\${targetFolder}\\${item.name} (1).${item.ext}`
-      : `${baseDir}\\${targetFolder}\\${fileNameWithExt}`;
-
-    result.push({
-      id: `file-${index}`,
-      file_name: fileNameWithExt,
-      extension: item.ext,
-      category: catName,
-      source_path: sourcePath,
-      destination_path: destPath,
-      size_bytes: item.size,
-      conflict_detected: isConflict,
-      relative_path: sub ? `${sub}\\${fileNameWithExt}` : fileNameWithExt,
-    });
-  });
-
-  return result;
 }
 
 // Format byte size cleanly
@@ -272,7 +186,6 @@ function showToast(message: string) {
 // DOM Elements
 let sourcePathInput: HTMLInputElement;
 let browseDirBtn: HTMLButtonElement;
-let loadSampleBtn: HTMLButtonElement;
 let subfolderCheckbox: HTMLInputElement;
 let ignoreHiddenCheckbox: HTMLInputElement;
 let tableSearchInput: HTMLInputElement;
@@ -338,7 +251,6 @@ window.addEventListener("DOMContentLoaded", () => {
 function cacheDOM() {
   sourcePathInput = document.getElementById("source-path-input") as HTMLInputElement;
   browseDirBtn = document.getElementById("browse-dir-btn") as HTMLButtonElement;
-  loadSampleBtn = document.getElementById("load-sample-btn") as HTMLButtonElement;
   subfolderCheckbox = document.getElementById("subfolder-checkbox") as HTMLInputElement;
   ignoreHiddenCheckbox = document.getElementById("ignore-hidden-checkbox") as HTMLInputElement;
   tableSearchInput = document.getElementById("table-search-input") as HTMLInputElement;
@@ -418,22 +330,10 @@ function setupDraggableResizer() {
 function setupEventListeners() {
   // Folder browsing
   browseDirBtn.addEventListener("click", handleBrowseFolder);
+  document.getElementById("empty-browse-btn")?.addEventListener("click", handleBrowseFolder);
   sourcePathInput.addEventListener("change", () => {
     currentPath = sourcePathInput.value.trim() || currentPath;
     triggerScan();
-  });
-
-  loadSampleBtn.addEventListener("click", () => {
-    currentPath = "C:\\Users\\Downloads";
-    sourcePathInput.value = currentPath;
-    triggerScan(true);
-    showToast("Loaded test dataset");
-  });
-
-  document.getElementById("empty-load-sample-btn")?.addEventListener("click", () => {
-    currentPath = "C:\\Users\\Downloads";
-    sourcePathInput.value = currentPath;
-    triggerScan(true);
   });
 
   // Subfolder switch
@@ -607,13 +507,13 @@ async function handleBrowseFolder() {
         const dir = await window.showDirectoryPicker();
         currentPath = `/${dir.name}`;
         sourcePathInput.value = currentPath;
-        triggerScan(true);
+        triggerScan();
         showToast(`Selected "${dir.name}"`);
       } catch {
         // canceled
       }
     } else {
-      showToast("Web preview: click 'Load test files' to test sorting");
+      showToast("Folder selection requires running as desktop app");
     }
   }
 }
@@ -834,9 +734,18 @@ function renderCustomTags() {
 }
 
 // Core Scanner
-async function triggerScan(forceDemo = false) {
+async function triggerScan() {
+  if (!currentPath || !currentPath.trim()) {
+    allPreviews = [];
+    selectedFileIds = new Set();
+    renderCategoryCards();
+    renderTable();
+    updateDockSummary();
+    return;
+  }
+
   try {
-    if (isTauri() && !forceDemo) {
+    if (isTauri()) {
       const scanRules: ScanRules = {
         categories,
         custom_extensions: customExtensions,
@@ -851,7 +760,7 @@ async function triggerScan(forceDemo = false) {
       });
       allPreviews = results;
     } else {
-      allPreviews = generateSampleDataset(currentPath, isSubfoldersEnabled);
+      allPreviews = [];
     }
 
     selectedFileIds = new Set(allPreviews.map((p) => p.id));
@@ -860,11 +769,12 @@ async function triggerScan(forceDemo = false) {
     updateDockSummary();
   } catch (err) {
     console.error(err);
-    allPreviews = generateSampleDataset(currentPath, isSubfoldersEnabled);
-    selectedFileIds = new Set(allPreviews.map((p) => p.id));
+    allPreviews = [];
+    selectedFileIds = new Set();
     renderCategoryCards();
     renderTable();
     updateDockSummary();
+    showToast(`Scan error: ${err}`);
   }
 }
 
@@ -910,6 +820,17 @@ function renderTable() {
   if (files.length === 0) {
     previewBody.innerHTML = "";
     tableEmptyState.classList.add("active");
+    const emptyTitle = document.getElementById("empty-state-title");
+    const emptySubtitle = document.getElementById("empty-state-subtitle");
+    if (emptyTitle && emptySubtitle) {
+      if (!currentPath || !currentPath.trim()) {
+        emptyTitle.textContent = "No folder selected";
+        emptySubtitle.textContent = "Click Browse to choose a folder to organize.";
+      } else {
+        emptyTitle.textContent = "No files matching active rules";
+        emptySubtitle.textContent = "Select another folder or adjust your categories on the left.";
+      }
+    }
   } else {
     tableEmptyState.classList.remove("active");
     let html = "";
