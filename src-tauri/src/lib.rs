@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+#[cfg(not(target_os = "windows"))]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryRule {
@@ -68,7 +71,14 @@ pub struct DirectoryStats {
     pub total_files: usize,
     pub total_size_bytes: u64,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransferProgress {
+    file_index: usize,
+    total_files: usize,
+}
 
+// Used only on non-Windows builds; Windows uses copy_file_native (CopyFileExW) instead.
+#[cfg(not(target_os = "windows"))]
 const FAST_COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const MAX_DESTINATION_ATTEMPTS: u32 = 10_000;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -187,6 +197,8 @@ fn verify_copy_completeness(destination: &Path, outcome: &CopyOutcome) -> io::Re
     Ok(())
 }
 
+// Used only on non-Windows builds; Windows uses copy_file_native (CopyFileExW) instead.
+#[cfg(not(target_os = "windows"))]
 fn copy_source_to_file(source: &Path, writer: &mut File) -> io::Result<CopyOutcome> {
     let mut reader = File::open(source)?;
     let expected_size = reader.metadata()?.len();
@@ -202,6 +214,51 @@ fn copy_source_to_file(source: &Path, writer: &mut File) -> io::Result<CopyOutco
     }
     writer.flush()?;
     writer.sync_all()?;
+    Ok(CopyOutcome {
+        expected_size,
+        copied_bytes,
+    })
+}
+
+/// Windows-native copy using CopyFileExW.
+/// Copies `source` to `dest` using the same OS kernel path Explorer uses.
+/// `dest` must exist (we created it as an empty temp placeholder) and will be overwritten.
+#[cfg(target_os = "windows")]
+fn copy_file_native(source: &Path, dest: &Path) -> io::Result<CopyOutcome> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let expected_size = fs::metadata(source)?.len();
+
+    let wide_src: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let wide_dst: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    extern "system" {
+        fn CopyFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            lpProgressRoutine: *mut std::ffi::c_void,
+            lpData: *mut std::ffi::c_void,
+            pbCancel: *mut i32,
+            dwCopyFlags: u32,
+        ) -> i32;
+    }
+
+    // dwCopyFlags = 0: overwrite the empty temp-file placeholder we created to reserve the name.
+    // Progress routine and cancel pointer are null for this phase.
+    let ok = unsafe {
+        CopyFileExW(
+            wide_src.as_ptr(),
+            wide_dst.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let copied_bytes = fs::metadata(dest)?.len();
     Ok(CopyOutcome {
         expected_size,
         copied_bytes,
@@ -298,16 +355,38 @@ fn copy_to_unique_destination(source: &Path, planned: &Path) -> io::Result<(Path
         )
     })?;
     fs::create_dir_all(parent)?;
-    let (temporary_path, mut temporary_file) = create_temporary_file(parent, planned)?;
-    let outcome = match copy_source_to_file(source, &mut temporary_file) {
-        Ok(outcome) => outcome,
-        Err(error) => {
+    let (temporary_path, temporary_file) = create_temporary_file(parent, planned)?;
+
+    let outcome = {
+        #[cfg(target_os = "windows")]
+        {
+            // Drop the handle so CopyFileExW can open the temp path exclusively.
             drop(temporary_file);
-            let _ = fs::remove_file(&temporary_path);
-            return Err(error);
+            match copy_file_native(source, &temporary_path) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary_path);
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut tf = temporary_file;
+            match copy_source_to_file(source, &mut tf) {
+                Ok(outcome) => {
+                    drop(tf);
+                    outcome
+                }
+                Err(error) => {
+                    drop(tf);
+                    let _ = fs::remove_file(&temporary_path);
+                    return Err(error);
+                }
+            }
         }
     };
-    drop(temporary_file);
+
     if let Err(error) = verify_copy_completeness(&temporary_path, &outcome) {
         let _ = fs::remove_file(&temporary_path);
         return Err(error);
@@ -539,9 +618,14 @@ async fn scan_directory(source_dir: String, rules: ScanRules) -> Result<ScanResu
     .map_err(|error| format!("Scan task failed: {error}"))?
 }
 
-fn execute_organization_blocking(items: &[FileAction], mode: &str) -> ExecutionSummary {
+fn execute_organization_blocking(
+    items: &[FileAction],
+    mode: &str,
+    on_progress: &dyn Fn(usize, usize),
+) -> ExecutionSummary {
     let start_time = Instant::now();
     let is_move = mode.eq_ignore_ascii_case("MOVE");
+    let total_files = items.len();
     let mut successful = 0;
     let mut failed = 0;
     let mut errors = Vec::new();
@@ -564,9 +648,11 @@ fn execute_organization_blocking(items: &[FileAction], mode: &str) -> ExecutionS
                 errors.push(format!("{}: {error}", item.source_path));
             }
         }
+        // Report per-file progress so the frontend can update the progress bar in real time.
+        on_progress(successful + failed, total_files);
     }
     ExecutionSummary {
-        total_processed: items.len(),
+        total_processed: total_files,
         successful,
         failed,
         time_taken_ms: start_time.elapsed().as_millis() as u64,
@@ -578,12 +664,23 @@ fn execute_organization_blocking(items: &[FileAction], mode: &str) -> ExecutionS
 
 #[tauri::command]
 async fn execute_organization(
+    app_handle: tauri::AppHandle,
     items: Vec<FileAction>,
     mode: String,
 ) -> Result<ExecutionSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(execute_organization_blocking(&items, &mode)))
-        .await
-        .map_err(|error| format!("Organization task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(execute_organization_blocking(&items, &mode, &|done, total| {
+            let _ = app_handle.emit(
+                "transfer-progress",
+                TransferProgress {
+                    file_index: done,
+                    total_files: total,
+                },
+            );
+        }))
+    })
+    .await
+    .map_err(|error| format!("Organization task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -704,6 +801,7 @@ mod tests {
                 action("second", &second, &target),
             ],
             "COPY",
+            &|_, _| {},
         );
         assert_eq!(summary.successful, 2);
         assert_eq!(summary.failed, 0);
@@ -725,7 +823,7 @@ mod tests {
         fs::write(&source, "source").unwrap();
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, "created after scan").unwrap();
-        let summary = execute_organization_blocking(&[action("source", &source, &target)], "COPY");
+        let summary = execute_organization_blocking(&[action("source", &source, &target)], "COPY", &|_, _| {});
         assert_eq!(summary.successful, 1);
         assert_eq!(fs::read_to_string(&target).unwrap(), "created after scan");
         assert_eq!(
@@ -751,7 +849,7 @@ mod tests {
         let source = directory.join("source.txt");
         let target = directory.join("organized/source.txt");
         fs::write(&source, "move me").unwrap();
-        let summary = execute_organization_blocking(&[action("source", &source, &target)], "MOVE");
+        let summary = execute_organization_blocking(&[action("source", &source, &target)], "MOVE", &|_, _| {});
         assert_eq!(summary.successful, 1);
         assert!(!source.exists());
         assert_eq!(fs::read_to_string(&target).unwrap(), "move me");
@@ -776,7 +874,7 @@ mod tests {
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, "already organized").unwrap();
         let summary_move =
-            execute_organization_blocking(&[action("self-move", &target, &target)], "MOVE");
+            execute_organization_blocking(&[action("self-move", &target, &target)], "MOVE", &|_, _| {});
         assert_eq!(summary_move.successful, 1);
         assert_eq!(
             summary_move.completed[0].destination_path,
@@ -786,7 +884,7 @@ mod tests {
         assert!(!directory.join("organized/source_1.txt").exists());
 
         let summary_copy =
-            execute_organization_blocking(&[action("self-copy", &target, &target)], "COPY");
+            execute_organization_blocking(&[action("self-copy", &target, &target)], "COPY", &|_, _| {});
         assert_eq!(summary_copy.successful, 1);
         assert_eq!(
             summary_copy.completed[0].destination_path,

@@ -43,8 +43,8 @@
 
 - `src-tauri/src/lib.rs — scan_directory`: async command running blocking traversal; filters dotfiles and Windows `FILE_ATTRIBUTE_HIDDEN` attributes, skips organizer folders during recursion, skips files already organized at destination (`is_same_file`), and reports `skipped_paths` for unreadable directories or metadata.
 - `src-tauri/src/lib.rs — resolve_preview_destination`: derives advisory `_N` preview names only.
-- `src-tauri/src/lib.rs — copy_to_unique_destination` / `transfer_item`: execution-time collision reservation and guarded move/copy engine.
-- `src-tauri/src/lib.rs — publish_temporary_file`: loops candidate `_N` destinations; uses `fs::hard_link` with safe non-overwriting fallback (`rename_no_overwrite` / `fallback_copy_stream_no_overwrite`) to support FAT32, exFAT, and USB drives without data overwrite risk.
+- `src-tauri/src/lib.rs — copy_to_unique_destination` / `transfer_item`: execution-time collision reservation and guarded move/copy engine. On Windows, copy uses `CopyFileExW` (via `copy_file_native`) instead of the portable 8 MiB read/write loop; the same temp-file-safe publish chain applies on all platforms.
+- `src-tauri/src/lib.rs — copy_file_native`: Windows-only (`#[cfg(target_os = "windows")]`) wrapper around `CopyFileExW`; copies source to the `.blaze-part-*` temp path, then `verify_copy_completeness` and `publish_temporary_file` run unchanged.
 - `src-tauri/src/lib.rs — try_same_filesystem_move`: link+unlink same-volume move with pre-deletion size checks.
 - `src-tauri/src/lib.rs — copy_then_remove_source`: guarded copy+unlink for cross-volume transfers and filesystems without hard-link support.
 - `src-tauri/src/lib.rs — is_same_file`: detects self-collision (source is already at nominal destination) and skips/preserves without creating `_1` suffixes.
@@ -52,9 +52,10 @@
 
 ## Frontend ↔ Backend Communication
 
-- `src/main.ts` imports `invoke` from `@tauri-apps/api/core` and dialog `open` from `@tauri-apps/plugin-dialog`.
+- `src/main.ts` imports `invoke` from `@tauri-apps/api/core`, `listen` from `@tauri-apps/api/event`, and dialog `open` from `@tauri-apps/plugin-dialog`.
 - `invoke("scan_directory", { sourceDir, rules })` maps camel-case call arguments to Rust `source_dir` / `ScanRules` and returns `ScanResult` (`previews` plus `skipped_paths`).
-- `invoke("execute_organization", { items, mode })` sends selected `FileAction[]` and gets `ExecutionSummary`, including actual destinations in `completed`.
+- `invoke("execute_organization", { items, mode })` sends selected `FileAction[]` and gets `ExecutionSummary`, including actual destinations in `completed`. Accepts `AppHandle` injected by Tauri to emit `transfer-progress` events.
+- `listen("transfer-progress", ...)` in `handleExecute` receives `TransferProgress` (`file_index`, `total_files`) events emitted by the backend after each file completes, updating the progress bar in real time.
 - Shared serializable DTO contracts live in `src/main.ts` interfaces and `src-tauri/src/lib.rs` structs; field names are aligned.
 
 ## File Organization / Transfer Flow
@@ -95,12 +96,18 @@
 5. **Execution UI Refresh**: Ensured both `execModalClose` and `execDoneBtn` close the modal and trigger `triggerScan()`, preventing stale table states after execution.
 6. **Critical Correctness Tests**: 10 unit tests in `src-tauri/src/lib.rs` verifying advisory names, collision resolution, duplicate batches, stale scan destinations, failed copy preservation, same-volume moves, cross-volume fallback moves, self-collision preservation, destination publishing fallbacks, and Windows hidden file detection.
 
+## Completed Phase 2 — Windows-Native Transfer Backend
+
+7. **CopyFileExW copy path**: On Windows, `copy_to_unique_destination` now calls `copy_file_native` which uses `CopyFileExW` (the same Win32 API Explorer uses). The empty `.blaze-part-*` temp file is created to reserve the name, its handle is dropped, then `CopyFileExW` writes the file, and the existing `verify_copy_completeness` + `publish_temporary_file` chain runs unchanged. Non-Windows builds retain the portable 8 MiB buffered copy path.
+8. **Real-time progress events**: `execute_organization` now accepts a `tauri::AppHandle` (injected by Tauri) and emits a `transfer-progress` event (payload: `{ file_index, total_files }`) after each file completes. `handleExecute` in `main.ts` subscribes with `listen()` before the invoke and unlistens in `finally`.
+9. **cfg-guarded dead code**: `FAST_COPY_BUFFER_SIZE`, `Read` import, and `copy_source_to_file` are now `#[cfg(not(target_os = "windows"))]`-guarded — zero dead_code warnings on Windows, zero compilation errors on other platforms.
+
 ## Known Issues / Deferred to Later Phases
 
-- High-performance transfer-engine rewrite (Phase 2: Windows-native optimized transfers) is intentionally deferred.
 - Size-only copy checks are completeness checks, not cryptographic content verification; stronger optional hashing (SHA-256) is deferred.
 - Skipped scan paths trigger a toast and console warning; a dedicated UI viewer for all skipped paths is deferred.
 - Integration tests for Tauri command IPC contracts and automated end-to-end frontend tests are deferred.
+- `CopyFileExW` cancellation hook is wired (null cancel pointer for now); an active cancel mechanism requires a future Tauri command and shared `AtomicBool`.
 
 ## Architectural Constraints
 
@@ -109,6 +116,7 @@
 - Do not follow directory symlinks during recursive scans; this avoids loops.
 - Never overwrite destination data: maintain collision protection at execution time, not only preview time; preview paths are advisory.
 - Release Cargo profile favors size/performance (`lto`, `opt-level=3`, `panic=abort`, strip).
+- Windows copy path uses `CopyFileExW`; do not add a large buffer pool or custom I/O scheduler. The temp-file-publish safety chain must remain intact for any copy implementation.
 
 ## Development Guidelines
 
@@ -125,4 +133,4 @@
 - Verify both same-volume rename and cross-volume copy/delete paths when changing transfers.
 - `README.md` remains the stock Tauri template and needs product-specific documentation.
 
-Last analyzed: 2026-09-23
+Last analyzed: 2026-09-23 (Phase 2 complete)

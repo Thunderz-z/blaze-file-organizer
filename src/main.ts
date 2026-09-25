@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import confetti from "canvas-confetti";
 
@@ -58,6 +59,11 @@ export interface ExecutionSummary {
   mode: string;
   errors: string[];
   completed: CompletedFile[];
+}
+
+interface TransferProgress {
+  file_index: number;
+  total_files: number;
 }
 
 // Built-in Default Categories
@@ -1006,6 +1012,17 @@ async function handleExecute() {
   const startTime = performance.now();
 
   if (isTauri()) {
+    // Subscribe to per-file progress events emitted by the native copy backend.
+    // This lets the bar advance incrementally instead of jumping 0→100% at the end.
+    const unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
+      const { file_index, total_files } = event.payload;
+      if (total_files > 0) {
+        const pct = Math.round((file_index / total_files) * 100);
+        execPercentage.textContent = `${pct}%`;
+        execRatio.textContent = `${file_index} / ${total_files}`;
+        execBarFill.style.width = `${pct}%`;
+      }
+    });
     try {
       const summary = await invoke<ExecutionSummary>("execute_organization", {
         items: actions,
@@ -1024,6 +1041,7 @@ async function handleExecute() {
       console.error(err);
       finishExecution(0, total, Math.round(performance.now() - startTime), 0, [`Execution failed: ${formatError(err)}`]);
     } finally {
+      unlisten();
       isExecuting = false;
       updateDockSummary();
     }
