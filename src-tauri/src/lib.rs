@@ -7,12 +7,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryRule {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub icon: Option<String>,
     pub enabled: bool,
     pub target_folder: String,
     pub extensions: Vec<String>,
@@ -717,6 +719,57 @@ fn greet(name: &str) -> String {
     format!("Blaze Engine ready. Hello, {name}!")
 }
 
+fn get_categories_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {e}"))?;
+    fs::create_dir_all(&data_dir).map_err(|e| format!("Failed to create app data directory: {e}"))?;
+    Ok(data_dir.join("categories.json"))
+}
+
+#[tauri::command]
+async fn save_categories(
+    app_handle: tauri::AppHandle,
+    categories: Vec<CategoryRule>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = get_categories_file_path(&app_handle)?;
+        let json = serde_json::to_string_pretty(&categories)
+            .map_err(|e| format!("Failed to serialize categories: {e}"))?;
+        fs::write(&path, json).map_err(|e| format!("Failed to write categories file: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Save categories task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn load_categories(
+    app_handle: tauri::AppHandle,
+) -> Result<Option<Vec<CategoryRule>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = get_categories_file_path(&app_handle)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to read categories file: {e}")),
+        };
+        if content.trim().is_empty() {
+            return Ok(None);
+        }
+        let rules: Vec<CategoryRule> = match serde_json::from_str(&content) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Failed to parse categories: {e}")),
+        };
+        Ok(Some(rules))
+    })
+    .await
+    .map_err(|e| format!("Load categories task failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -726,7 +779,9 @@ pub fn run() {
             greet,
             scan_directory,
             execute_organization,
-            get_folder_stats
+            get_folder_stats,
+            save_categories,
+            load_categories
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

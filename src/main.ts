@@ -73,7 +73,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Images",
     icon: "🖼",
     enabled: true,
-    target_folder: "Images",
+    target_folder: "\\Images",
     extensions: ["jpg", "jpeg", "png", "gif", "webp", "svg", "heic", "raw"],
   },
   {
@@ -81,7 +81,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Documents",
     icon: "📄",
     enabled: true,
-    target_folder: "Documents",
+    target_folder: "\\Documents",
     extensions: ["pdf", "docx", "xlsx", "txt", "csv", "pptx", "md", "epub"],
   },
   {
@@ -89,7 +89,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Videos",
     icon: "🎬",
     enabled: true,
-    target_folder: "Videos",
+    target_folder: "\\Videos",
     extensions: ["mp4", "mkv", "mov", "avi", "webm", "m4v"],
   },
   {
@@ -97,7 +97,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Audio",
     icon: "🎵",
     enabled: true,
-    target_folder: "Audio",
+    target_folder: "\\Audio",
     extensions: ["mp3", "wav", "flac", "aac", "ogg", "m4a"],
   },
   {
@@ -105,7 +105,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Archives",
     icon: "📦",
     enabled: true,
-    target_folder: "Archives",
+    target_folder: "\\Archives",
     extensions: ["zip", "rar", "7z", "tar", "gz", "bz2", "iso"],
   },
   {
@@ -113,7 +113,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Code",
     icon: "💻",
     enabled: true,
-    target_folder: "Code",
+    target_folder: "\\Code",
     extensions: ["rs", "ts", "tsx", "js", "jsx", "py", "html", "css", "json", "sql"],
   },
 ];
@@ -255,11 +255,58 @@ let execSuccessVal: HTMLElement;
 let execFailedVal: HTMLElement;
 let execLogConsole: HTMLElement;
 
+async function loadSavedCategories() {
+  try {
+    const local = localStorage.getItem("blaze_categories");
+    if (local) {
+      const parsed = JSON.parse(local);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        categories = parsed;
+      }
+    }
+  } catch (err) {
+    console.warn("Failed to read categories from localStorage:", err);
+  }
+
+  if (isTauri()) {
+    try {
+      const saved = await invoke<CategoryRule[] | null>("load_categories");
+      if (saved && Array.isArray(saved) && saved.length > 0) {
+        categories = saved;
+        try {
+          localStorage.setItem("blaze_categories", JSON.stringify(categories));
+        } catch {
+          // ignore
+        }
+      }
+    } catch (err) {
+      console.warn("Failed to load categories from file:", err);
+    }
+  }
+}
+
+async function persistCategories() {
+  try {
+    localStorage.setItem("blaze_categories", JSON.stringify(categories));
+  } catch (err) {
+    console.warn("Failed to save categories to localStorage:", err);
+  }
+
+  if (isTauri()) {
+    try {
+      await invoke("save_categories", { categories });
+    } catch (err) {
+      console.error("Failed to save categories to file:", err);
+    }
+  }
+}
+
 // Initialize
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   cacheDOM();
   setupDraggableResizer();
   setupEventListeners();
+  await loadSavedCategories();
   renderCategoryCards();
   renderCustomTags();
   renderFilterChips();
@@ -385,12 +432,14 @@ function setupEventListeners() {
     categories.forEach((c) => (c.enabled = true));
     renderCategoryCards();
     triggerScan();
+    persistCategories();
   });
 
   document.getElementById("clear-all-rules-btn")?.addEventListener("click", () => {
     categories.forEach((c) => (c.enabled = false));
     renderCategoryCards();
     triggerScan();
+    persistCategories();
   });
 
   // Add Category
@@ -611,11 +660,13 @@ function renderCategoryCards() {
       cat.enabled = !cat.enabled;
       renderCategoryCards();
       triggerScan();
+      persistCategories();
     });
     checkbox.addEventListener("change", (e) => {
       cat.enabled = (e.target as HTMLInputElement).checked;
       renderCategoryCards();
       triggerScan();
+      persistCategories();
     });
     editButton.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -741,6 +792,7 @@ function saveCategory() {
   renderCategoryCards();
   triggerScan();
   showToast(`Saved category "${name}"`);
+  persistCategories();
 }
 
 function deleteCategory() {
@@ -750,6 +802,7 @@ function deleteCategory() {
   renderCategoryCards();
   triggerScan();
   showToast("Category removed");
+  persistCategories();
 }
 
 // Custom Extension Tags
