@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import confetti from "canvas-confetti";
 
@@ -40,6 +41,16 @@ export interface FileAction {
   file_name: string;
 }
 
+export interface ScanResult {
+  previews: FilePreview[];
+  skipped_paths: string[];
+}
+
+export interface CompletedFile {
+  id: string;
+  destination_path: string;
+}
+
 export interface ExecutionSummary {
   total_processed: number;
   successful: number;
@@ -47,6 +58,12 @@ export interface ExecutionSummary {
   time_taken_ms: number;
   mode: string;
   errors: string[];
+  completed: CompletedFile[];
+}
+
+interface TransferProgress {
+  file_index: number;
+  total_files: number;
 }
 
 // Built-in Default Categories
@@ -56,7 +73,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Images",
     icon: "🖼",
     enabled: true,
-    target_folder: "Images",
+    target_folder: "\\Images",
     extensions: ["jpg", "jpeg", "png", "gif", "webp", "svg", "heic", "raw"],
   },
   {
@@ -64,7 +81,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Documents",
     icon: "📄",
     enabled: true,
-    target_folder: "Documents",
+    target_folder: "\\Documents",
     extensions: ["pdf", "docx", "xlsx", "txt", "csv", "pptx", "md", "epub"],
   },
   {
@@ -72,7 +89,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Videos",
     icon: "🎬",
     enabled: true,
-    target_folder: "Videos",
+    target_folder: "\\Videos",
     extensions: ["mp4", "mkv", "mov", "avi", "webm", "m4v"],
   },
   {
@@ -80,7 +97,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Audio",
     icon: "🎵",
     enabled: true,
-    target_folder: "Audio",
+    target_folder: "\\Audio",
     extensions: ["mp3", "wav", "flac", "aac", "ogg", "m4a"],
   },
   {
@@ -88,7 +105,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Archives",
     icon: "📦",
     enabled: true,
-    target_folder: "Archives",
+    target_folder: "\\Archives",
     extensions: ["zip", "rar", "7z", "tar", "gz", "bz2", "iso"],
   },
   {
@@ -96,7 +113,7 @@ const DEFAULT_CATEGORIES: CategoryRule[] = [
     name: "Code",
     icon: "💻",
     enabled: true,
-    target_folder: "Code",
+    target_folder: "\\Code",
     extensions: ["rs", "ts", "tsx", "js", "jsx", "py", "html", "css", "json", "sql"],
   },
 ];
@@ -115,6 +132,7 @@ let activeCategoryFilter = "all";
 let searchQuery = "";
 let sortColumn: "name" | "category" | "size" = "name";
 let sortDirection: "asc" | "desc" = "asc";
+let isExecuting = false;
 
 // Modal State for Editing Category
 let editingCategoryId: string | null = null;
@@ -237,11 +255,58 @@ let execSuccessVal: HTMLElement;
 let execFailedVal: HTMLElement;
 let execLogConsole: HTMLElement;
 
+async function loadSavedCategories() {
+  try {
+    const local = localStorage.getItem("blaze_categories");
+    if (local) {
+      const parsed = JSON.parse(local);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        categories = parsed;
+      }
+    }
+  } catch (err) {
+    console.warn("Failed to read categories from localStorage:", err);
+  }
+
+  if (isTauri()) {
+    try {
+      const saved = await invoke<CategoryRule[] | null>("load_categories");
+      if (saved && Array.isArray(saved) && saved.length > 0) {
+        categories = saved;
+        try {
+          localStorage.setItem("blaze_categories", JSON.stringify(categories));
+        } catch {
+          // ignore
+        }
+      }
+    } catch (err) {
+      console.warn("Failed to load categories from file:", err);
+    }
+  }
+}
+
+async function persistCategories() {
+  try {
+    localStorage.setItem("blaze_categories", JSON.stringify(categories));
+  } catch (err) {
+    console.warn("Failed to save categories to localStorage:", err);
+  }
+
+  if (isTauri()) {
+    try {
+      await invoke("save_categories", { categories });
+    } catch (err) {
+      console.error("Failed to save categories to file:", err);
+    }
+  }
+}
+
 // Initialize
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   cacheDOM();
   setupDraggableResizer();
   setupEventListeners();
+  await loadSavedCategories();
   renderCategoryCards();
   renderCustomTags();
   renderFilterChips();
@@ -367,12 +432,14 @@ function setupEventListeners() {
     categories.forEach((c) => (c.enabled = true));
     renderCategoryCards();
     triggerScan();
+    persistCategories();
   });
 
   document.getElementById("clear-all-rules-btn")?.addEventListener("click", () => {
     categories.forEach((c) => (c.enabled = false));
     renderCategoryCards();
     triggerScan();
+    persistCategories();
   });
 
   // Add Category
@@ -473,7 +540,9 @@ function setupEventListeners() {
 
   // Execution Modal Handlers
   execModalClose.addEventListener("click", () => {
+    if (isExecuting) return;
     executionModal.classList.add("hidden");
+    triggerScan();
   });
   execDoneBtn.addEventListener("click", () => {
     executionModal.classList.add("hidden");
@@ -532,52 +601,74 @@ function renderCategoryCards() {
     const card = document.createElement("div");
     card.className = `category-card ${cat.enabled ? "active" : "disabled"}`;
     card.setAttribute("data-id", cat.id);
-
-    // Count how many files currently belong to this category
     const count = allPreviews.filter((p) => p.category.toLowerCase() === cat.name.toLowerCase()).length;
 
-    card.innerHTML = `
-      <div class="category-left" title="Click to toggle inclusion">
-        <label class="toggle-option" onclick="event.stopPropagation()">
-          <input type="checkbox" class="cat-checkbox" data-id="${cat.id}" ${cat.enabled ? "checked" : ""} />
-          <span class="toggle-box"></span>
-        </label>
-        <div class="category-icon-box ${getCategoryColorClass(cat.name)}">${cat.icon || "📁"}</div>
-        <div class="category-info">
-          <div class="category-title-row">
-            <span class="category-name-text">${cat.name}</span>
-            <span class="category-target-path">→ ${cat.target_folder}/</span>
-          </div>
-          <span class="category-exts-preview">${cat.extensions.join(" · ")}</span>
-        </div>
-      </div>
-      <div class="category-right">
-        <span class="category-count">${count}</span>
-        <button class="category-edit-btn" data-id="${cat.id}" title="Edit category rules">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 20h9"/>
-            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
-          </svg>
-        </button>
-      </div>
-    `;
+    const left = document.createElement("div");
+    left.className = "category-left";
+    left.title = "Click to toggle inclusion";
+    const label = document.createElement("label");
+    label.className = "toggle-option";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = "cat-checkbox";
+    checkbox.dataset.id = cat.id;
+    checkbox.checked = cat.enabled;
+    const toggleBox = document.createElement("span");
+    toggleBox.className = "toggle-box";
+    label.append(checkbox, toggleBox);
+    const icon = document.createElement("div");
+    icon.className = `category-icon-box ${getCategoryColorClass(cat.name)}`;
+    icon.textContent = cat.icon || "📁";
+    const info = document.createElement("div");
+    info.className = "category-info";
+    const titleRow = document.createElement("div");
+    titleRow.className = "category-title-row";
+    const name = document.createElement("span");
+    name.className = "category-name-text";
+    name.textContent = cat.name;
+    const target = document.createElement("span");
+    target.className = "category-target-path";
+    target.textContent = `→ ${cat.target_folder}/`;
+    titleRow.append(name, target);
+    const extensions = document.createElement("span");
+    extensions.className = "category-exts-preview";
+    extensions.textContent = cat.extensions.join(" · ");
+    info.append(titleRow, extensions);
+    left.append(label, icon, info);
 
-    // Click left area toggles enabled state
-    card.querySelector(".category-left")?.addEventListener("click", () => {
+    const right = document.createElement("div");
+    right.className = "category-right";
+    const countLabel = document.createElement("span");
+    countLabel.className = "category-count";
+    countLabel.textContent = String(count);
+    const editButton = document.createElement("button");
+    editButton.className = "category-edit-btn";
+    editButton.dataset.id = cat.id;
+    editButton.title = "Edit category rules";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", "13"); svg.setAttribute("height", "13"); svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none"); svg.setAttribute("stroke", "currentColor"); svg.setAttribute("stroke-width", "2");
+    for (const d of ["M12 20h9", "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"]) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", d); svg.appendChild(path);
+    }
+    editButton.appendChild(svg);
+    right.append(countLabel, editButton);
+    card.append(left, right);
+
+    left.addEventListener("click", (event) => {
+      if ((event.target as HTMLElement).closest(".toggle-option")) return;
       cat.enabled = !cat.enabled;
       renderCategoryCards();
       triggerScan();
+      persistCategories();
     });
-
-    // Checkbox toggles enabled state
-    card.querySelector(".cat-checkbox")?.addEventListener("change", (e) => {
+    checkbox.addEventListener("change", (e) => {
       cat.enabled = (e.target as HTMLInputElement).checked;
       renderCategoryCards();
       triggerScan();
+      persistCategories();
     });
-
-    // Edit button opens modal
-    card.querySelector(".category-edit-btn")?.addEventListener("click", (e) => {
+    editButton.addEventListener("click", (e) => {
       e.stopPropagation();
       openCategoryModal(cat.id);
     });
@@ -701,6 +792,7 @@ function saveCategory() {
   renderCategoryCards();
   triggerScan();
   showToast(`Saved category "${name}"`);
+  persistCategories();
 }
 
 function deleteCategory() {
@@ -710,6 +802,7 @@ function deleteCategory() {
   renderCategoryCards();
   triggerScan();
   showToast("Category removed");
+  persistCategories();
 }
 
 // Custom Extension Tags
@@ -718,17 +811,19 @@ function renderCustomTags() {
   customExtensions.forEach((ext) => {
     const tag = document.createElement("span");
     tag.className = "custom-tag-chip";
-    tag.innerHTML = `
-      <span>.${ext}</span>
-      <button class="custom-tag-remove" data-ext="${ext}" title="Remove">&times;</button>
-    `;
-
-    tag.querySelector(".custom-tag-remove")?.addEventListener("click", () => {
+    const label = document.createElement("span");
+    label.textContent = `.${ext}`;
+    const removeButton = document.createElement("button");
+    removeButton.className = "custom-tag-remove";
+    removeButton.dataset.ext = ext;
+    removeButton.title = "Remove";
+    removeButton.textContent = "×";
+    removeButton.addEventListener("click", () => {
       customExtensions = customExtensions.filter((e) => e !== ext);
       renderCustomTags();
       triggerScan();
     });
-
+    tag.append(label, removeButton);
     customTagsContainer.appendChild(tag);
   });
 }
@@ -754,11 +849,15 @@ async function triggerScan() {
         custom_target_dir: null,
       };
 
-      const results = await invoke<FilePreview[]>("scan_directory", {
+      const result = await invoke<ScanResult>("scan_directory", {
         sourceDir: currentPath,
         rules: scanRules,
       });
-      allPreviews = results;
+      allPreviews = result.previews;
+      if (result.skipped_paths.length > 0) {
+        console.warn("Scan skipped paths:", result.skipped_paths);
+        showToast(`Scan completed with ${result.skipped_paths.length} skipped path(s): ${result.skipped_paths[0]}`);
+      }
     } else {
       allPreviews = [];
     }
@@ -833,71 +932,79 @@ function renderTable() {
     }
   } else {
     tableEmptyState.classList.remove("active");
-    let html = "";
-
     const actionVerb = operationMode === "MOVE" ? "Move" : "Copy";
-
+    const fragment = document.createDocumentFragment();
     files.forEach((file) => {
       const isSelected = selectedFileIds.has(file.id);
       const actionText = file.conflict_detected ? "Rename on conflict" : actionVerb;
       const actionClass = file.conflict_detected ? "action-status rename" : "action-status ready";
       const srcDisplay = formatCompactPath(file.relative_path || file.source_path);
       const destDisplay = formatCompactPath(file.destination_path);
-
-      html += `
-        <tr class="${isSelected ? "selected" : ""}" data-id="${file.id}">
-          <td class="col-checkbox">
-            <input type="checkbox" class="row-checkbox" data-id="${file.id}" ${isSelected ? "checked" : ""} />
-          </td>
-          <td class="col-name" title="${file.file_name}">
-            ${file.file_name}
-          </td>
-          <td class="col-type">
-            <span class="type-badge">${file.extension}</span>
-          </td>
-          <td class="col-category">
-            <span class="cat-badge ${getCategoryBadgeClass(file.category)}">${file.category}</span>
-          </td>
-          <td class="col-size">${formatBytes(file.size_bytes)}</td>
-          <td class="col-source" title="${file.source_path}">${srcDisplay}</td>
-          <td class="col-destination" title="${file.destination_path}">${destDisplay}</td>
-          <td class="col-action">
-            <span class="${actionClass}">${actionText}</span>
-          </td>
-        </tr>
-      `;
-    });
-
-    previewBody.innerHTML = html;
-
-    // Attach row checkbox toggles
-    previewBody.querySelectorAll<HTMLInputElement>(".row-checkbox").forEach((cb) => {
-      cb.addEventListener("change", (e) => {
-        const id = cb.getAttribute("data-id");
-        if (!id) return;
-        if (cb.checked) {
-          selectedFileIds.add(id);
-          cb.closest("tr")?.classList.add("selected");
+      const row = document.createElement("tr");
+      row.className = isSelected ? "selected" : "";
+      row.dataset.id = file.id;
+      const checkboxCell = document.createElement("td");
+      checkboxCell.className = "col-checkbox";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "row-checkbox";
+      checkbox.dataset.id = file.id;
+      checkbox.checked = isSelected;
+      checkboxCell.appendChild(checkbox);
+      const makeCell = (className: string, text: string, title?: string) => {
+        const cell = document.createElement("td");
+        cell.className = className;
+        cell.textContent = text;
+        if (title) cell.title = title;
+        return cell;
+      };
+      const typeCell = document.createElement("td");
+      typeCell.className = "col-type";
+      const typeBadge = document.createElement("span");
+      typeBadge.className = "type-badge";
+      typeBadge.textContent = file.extension;
+      typeCell.appendChild(typeBadge);
+      const categoryCell = document.createElement("td");
+      categoryCell.className = "col-category";
+      const categoryBadge = document.createElement("span");
+      categoryBadge.className = `cat-badge ${getCategoryBadgeClass(file.category)}`;
+      categoryBadge.textContent = file.category;
+      categoryCell.appendChild(categoryBadge);
+      const actionCell = document.createElement("td");
+      actionCell.className = "col-action";
+      const actionStatus = document.createElement("span");
+      actionStatus.className = actionClass;
+      actionStatus.textContent = actionText;
+      actionCell.appendChild(actionStatus);
+      row.append(
+        checkboxCell,
+        makeCell("col-name", file.file_name, file.file_name),
+        typeCell,
+        categoryCell,
+        makeCell("col-size", formatBytes(file.size_bytes)),
+        makeCell("col-source", srcDisplay, file.source_path),
+        makeCell("col-destination", destDisplay, file.destination_path),
+        actionCell,
+      );
+      checkbox.addEventListener("change", (event) => {
+        if (checkbox.checked) {
+          selectedFileIds.add(file.id);
+          row.classList.add("selected");
         } else {
-          selectedFileIds.delete(id);
-          cb.closest("tr")?.classList.remove("selected");
+          selectedFileIds.delete(file.id);
+          row.classList.remove("selected");
         }
         updateDockSummary();
-        e.stopPropagation();
+        event.stopPropagation();
       });
-    });
-
-    // Row click toggles selection
-    previewBody.querySelectorAll<HTMLTableRowElement>("tr").forEach((tr) => {
-      tr.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).tagName === "INPUT") return;
-        const cb = tr.querySelector<HTMLInputElement>(".row-checkbox");
-        if (cb) {
-          cb.checked = !cb.checked;
-          cb.dispatchEvent(new Event("change"));
-        }
+      row.addEventListener("click", (event) => {
+        if ((event.target as HTMLElement).tagName === "INPUT") return;
+        checkbox.checked = !checkbox.checked;
+        checkbox.dispatchEvent(new Event("change"));
       });
+      fragment.appendChild(row);
     });
+    previewBody.replaceChildren(fragment);
   }
 }
 
@@ -923,8 +1030,10 @@ function updateDockSummary() {
 
 // FastCopy-style High-Speed Execution Handler
 async function handleExecute() {
+  if (isExecuting) return;
   const selectedItems = allPreviews.filter((p) => selectedFileIds.has(p.id));
   if (selectedItems.length === 0) return;
+  isExecuting = true;
 
   const total = selectedItems.length;
   const actionWord = operationMode === "MOVE" ? "Moving" : "Copying";
@@ -943,6 +1052,7 @@ async function handleExecute() {
   execSpeedVal.textContent = "--";
   execSuccessVal.textContent = "--";
   execFailedVal.textContent = "0";
+  executeBtn.disabled = true;
 
   const actions: FileAction[] = selectedItems.map((p) => ({
     id: p.id,
@@ -955,6 +1065,17 @@ async function handleExecute() {
   const startTime = performance.now();
 
   if (isTauri()) {
+    // Subscribe to per-file progress events emitted by the native copy backend.
+    // This lets the bar advance incrementally instead of jumping 0→100% at the end.
+    const unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
+      const { file_index, total_files } = event.payload;
+      if (total_files > 0) {
+        const pct = Math.round((file_index / total_files) * 100);
+        execPercentage.textContent = `${pct}%`;
+        execRatio.textContent = `${file_index} / ${total_files}`;
+        execBarFill.style.width = `${pct}%`;
+      }
+    });
     try {
       const summary = await invoke<ExecutionSummary>("execute_organization", {
         items: actions,
@@ -963,11 +1084,19 @@ async function handleExecute() {
 
       const elapsed = summary.time_taken_ms || Math.round(performance.now() - startTime);
       const speed = Math.round(summary.successful / Math.max(elapsed / 1000, 0.001));
-
+      const completedDestinations = new Map(summary.completed.map((item) => [item.id, item.destination_path]));
+      allPreviews = allPreviews.map((preview) => ({
+        ...preview,
+        destination_path: completedDestinations.get(preview.id) || preview.destination_path,
+      }));
       finishExecution(summary.successful, summary.failed, elapsed, speed, summary.errors);
     } catch (err) {
       console.error(err);
-      finishExecution(total, 0, Math.round(performance.now() - startTime), 1200, []);
+      finishExecution(0, total, Math.round(performance.now() - startTime), 0, [`Execution failed: ${formatError(err)}`]);
+    } finally {
+      unlisten();
+      isExecuting = false;
+      updateDockSummary();
     }
   } else {
     // Ultra-fast simulated transfer with rapid progress chunks
@@ -984,6 +1113,8 @@ async function handleExecute() {
         const speed = Math.round(total / Math.max(elapsed / 1000, 0.001));
 
         finishExecution(total, 0, elapsed, speed, []);
+        isExecuting = false;
+        updateDockSummary();
       } else {
         const pct = Math.round((processed / total) * 100);
         execPercentage.textContent = `${pct}%`;
@@ -999,6 +1130,10 @@ async function handleExecute() {
   }
 }
 
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function appendLog(msg: string) {
   const line = document.createElement("div");
   line.className = "log-line info";
@@ -1012,15 +1147,22 @@ function finishExecution(successful: number, failed: number, elapsedMs: number, 
   execRatio.textContent = `${successful} / ${successful + failed}`;
   execBarFill.style.width = "100%";
 
-  document.getElementById("exec-modal-title")!.textContent = "Organization Completed";
-  document.getElementById("exec-modal-subtitle")!.textContent = `Organized ${successful} files in ${elapsedMs}ms (${speed} files/sec)`;
+  const completedWithoutErrors = failed === 0 && errors.length === 0;
+  document.getElementById("exec-modal-title")!.textContent = completedWithoutErrors
+    ? "Organization Completed"
+    : successful > 0
+      ? "Organization Completed With Errors"
+      : "Organization Failed";
+  document.getElementById("exec-modal-subtitle")!.textContent = completedWithoutErrors
+    ? `Organized ${successful} files in ${elapsedMs}ms (${speed} files/sec)`
+    : `${successful} succeeded, ${failed} failed or were not confirmed. Review the log for details.`;
 
   execTimeVal.textContent = `${elapsedMs} ms`;
   execSpeedVal.textContent = `${speed} /s`;
   execSuccessVal.textContent = `${successful}`;
   execFailedVal.textContent = `${failed}`;
 
-  appendLog(`Completed: ${successful} files processed successfully.`);
+  appendLog(completedWithoutErrors ? `Completed: ${successful} files processed successfully.` : `Completed with errors: ${successful} succeeded, ${failed} failed.`);
   if (errors.length > 0) {
     errors.forEach((e) => appendLog(`Warning: ${e}`));
   }
@@ -1028,15 +1170,17 @@ function finishExecution(successful: number, failed: number, elapsedMs: number, 
   execDoneBtn.style.display = "inline-flex";
 
   try {
-    confetti({
-      particleCount: 60,
-      spread: 60,
-      origin: { y: 0.6 },
-      colors: ["#0F172A", "#2563EB", "#059669"],
-    });
+    if (completedWithoutErrors) {
+      confetti({
+        particleCount: 60,
+        spread: 60,
+        origin: { y: 0.6 },
+        colors: ["#0F172A", "#2563EB", "#059669"],
+      });
+    }
   } catch {
     // ignore
   }
 
-  showToast(`Organized ${successful} files`);
+  showToast(completedWithoutErrors ? `Organized ${successful} files` : `Organization finished with ${failed} error(s)`);
 }
