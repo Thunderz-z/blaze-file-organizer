@@ -19,6 +19,7 @@ npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
 AI_CONTEXT.md
+implementation_plan.md
 
 # OS & IDE Files
 .vscode/
