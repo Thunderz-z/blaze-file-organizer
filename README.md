@@ -65,6 +65,14 @@ Blaze does not blindly reorganize a directory. It scans the filesystem, shows wh
 
 ---
 
+
+## Screenshots
+
+![Blaze File Organizer](screenshots/photo_1.png)
+![Blaze File Organizer](screenshots/photo_2.png)
+
+---
+
 ## How It Works
 
 ```text
@@ -162,11 +170,6 @@ Blaze also detects when a file is already at its intended destination so that re
 
 > **Verification note:** current copy verification checks transfer completeness using file size/byte counts. It does not perform cryptographic SHA-256 or BLAKE3 content hashing.
 
----
-
-## Screenshots
-
-![Blaze File Organizer](screenshots/photo_1.jpg)
 
 ---
 
